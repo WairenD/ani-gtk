@@ -475,6 +475,9 @@ class UI:
         shortcuts_action = Gio.SimpleAction.new("shortcuts", None)
         shortcuts_action.connect("activate", lambda *_: self.show_shortcuts())
         self.root.add_action(shortcuts_action)
+        about_action = Gio.SimpleAction.new("about", None)
+        about_action.connect("activate", lambda *_: self.show_about())
+        self.root.add_action(about_action)
         application = self.root.get_application()
         application.set_accels_for_action("win.login", ["<Primary>l"])
         application.set_accels_for_action(
@@ -498,6 +501,7 @@ class UI:
 
         help_menu = Gio.Menu()
         help_menu.append("Keyboard Shortcuts", "win.shortcuts")
+        help_menu.append("About AniList Library Explorer", "win.about")
         menu_model.append_submenu("Help", help_menu)
 
         return menu_model
@@ -536,6 +540,20 @@ class UI:
         section.add_group(group)
         shortcuts_window.add_section(section)
         shortcuts_window.present()
+
+    def show_about(self):
+        about_dialog = Gtk.AboutDialog(transient_for=self.root, modal=True)
+        about_dialog.set_program_name("AniList Library Explorer")
+        about_dialog.set_version("0.1.0")
+        about_dialog.set_comments(
+            "Browse and manage your AniList anime library. Update episode "
+            "progress and scores, view anime details, and optionally detect "
+            "local video playback to advance currently watching episodes."
+        )
+        about_dialog.set_website("https://anilist.co/")
+        about_dialog.set_website_label("AniList")
+        about_dialog.set_authors(["AniList Library Explorer contributors"])
+        about_dialog.present()
 
     def update_library_summary(self):
         watching = self.category_views.get("CURRENTLY WATCHING")
@@ -1306,13 +1324,20 @@ if (!token || state !== expectedState) {
 def read_client_id():
     if client_id := os.environ.get("ANILIST_CLIENT_ID", "").strip():
         return client_id
-    config = configparser.ConfigParser()
-    config_path = Path(__file__).resolve().parent.parent / "config.ini"
-    try:
-        config.read(config_path)
-        return config.get("ANILIST", "client_id", fallback="").strip()
-    except (OSError, configparser.Error):
-        return ""
+    config_paths = (
+        Path("/etc/ani-gtk/config.ini"),
+        Path(__file__).resolve().parent.parent / "config.ini",
+    )
+    for config_path in config_paths:
+        config = configparser.ConfigParser()
+        try:
+            config.read(config_path)
+            client_id = config.get("ANILIST", "client_id", fallback="").strip()
+            if client_id:
+                return client_id
+        except (OSError, configparser.Error):
+            continue
+    return ""
 
 
 def prepare_media_entries(media_lists):
