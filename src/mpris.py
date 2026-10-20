@@ -276,16 +276,16 @@ def extract_episode_info(value):
     text = Path(unquote(urlparse(value).path)).name if "://" in value else value
     patterns = (
         (
-            r"(?i)(?:^|[^a-z0-9])s\s*(\d{1,2})\s*[._ -]*e\s*(\d{1,3})(?!\d)",
+            r"(?i)(?:^|[^a-z0-9])s[._ -]*(\d{1,2})[._ -]*e[._ -]*(\d{1,3})(?!\d)",
             "season",
         ),
         (
-            r"(?i)(?:^|[^a-z0-9])(\d{1,2})\s*x\s*(\d{1,3})(?!\d)",
+            r"(?i)(?:^|[^a-z0-9])(\d{1,2})[._ -]*x[._ -]*(\d{1,3})(?!\d)",
             "season",
         ),
         (
-            r"(?i)(?:^|[^a-z0-9])season[._ -]*(\d{1,2})[._ -]*(?:episode|ep)[._ -]*(\d{1,3})(?!\d)",
-            "season",
+            r"(?i)(?:^|[^a-z0-9])(?:season[._ -]*(\d{1,2})|([1-9]\d?)(?:st|nd|rd|th)[._ -]*season)[._ -]*(?:episode|ep|e)[._ -]*(\d{1,3})(?!\d)",
+            "season_labeled",
         ),
         (
             r"(?i)(?:^|[^a-z0-9])season[._ -]*(\d{1,2})[._ -]+(\d{1,3})(?!\d)",
@@ -295,6 +295,8 @@ def extract_episode_info(value):
             r"(?i)(?:^|[^a-z0-9])(?:episode|ep)[._ -]*(\d{1,3})(?!\d)",
             "episode",
         ),
+        (r"(?i)(?:^|[^a-z0-9])e[._ -]*(\d{1,3})(?!\d)", "episode"),
+        (r"(?i)(?:^|[^a-z0-9])#\s*(\d{1,3})(?!\d)", "episode"),
     )
     for pattern, kind in patterns:
         match = re.search(pattern, text)
@@ -302,14 +304,22 @@ def extract_episode_info(value):
             continue
         if kind == "season":
             season, episode = (int(value) for value in match.groups())
+        elif kind == "season_labeled":
+            season = int(match.group(1) or match.group(2))
+            episode = int(match.group(3))
         else:
             season, episode = None, int(match.group(1))
         if episode > 0:
             return season, episode
 
-    # Common fansub naming: "Show - 01 - Episode title". Require a delimiter
-    # on both sides and reject release-resolution/codec-style tokens.
-    match = re.search(r"(?:^|[ ._-])[([]?(\d{1,3})[)\]]?(?=[ ._-])", text)
+    # Explicitly bracketed numbers may exceed the usual two-digit range.
+    match = re.search(r"[([]\s*(\d{1,3})\s*[)\]]", text)
+    if match and int(match.group(1)) > 0:
+        return None, int(match.group(1))
+
+    # Common fansub naming: "Show - 01 - Episode title". Keep bare numbers
+    # to two digits to avoid treating years or release metadata as episodes.
+    match = re.search(r"(?:^|[ ._-])(\d{1,2})(?!\d)(?=[ ._-]|$)", text)
     if match and int(match.group(1)) > 0:
         return None, int(match.group(1))
     return None
