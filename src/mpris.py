@@ -275,17 +275,26 @@ def extract_episode_number(value):
 def extract_episode_info(value):
     text = Path(unquote(urlparse(value).path)).name if "://" in value else value
     patterns = (
-        (r"(?i)\bs\s*(\d{1,2})\s*[._ -]*e\s*(\d{1,3})\b", "season"),
-        (r"(?i)\b(\d{1,2})\s*x\s*(\d{1,3})\b", "season"),
         (
-            r"(?i)\bseason[._ -]*(\d{1,2})[._ -]*(?:episode|ep)[._ -]*(\d{1,3})\b",
+            r"(?i)(?:^|[^a-z0-9])s\s*(\d{1,2})\s*[._ -]*e\s*(\d{1,3})(?!\d)",
             "season",
         ),
         (
-            r"(?i)\bseason[._ -]*(\d{1,2})[._ -]+(\d{1,3})\b",
+            r"(?i)(?:^|[^a-z0-9])(\d{1,2})\s*x\s*(\d{1,3})(?!\d)",
             "season",
         ),
-        (r"(?i)\b(?:episode|ep)\s*[.# -]*\s*(\d{1,3})\b", "episode"),
+        (
+            r"(?i)(?:^|[^a-z0-9])season[._ -]*(\d{1,2})[._ -]*(?:episode|ep)[._ -]*(\d{1,3})(?!\d)",
+            "season",
+        ),
+        (
+            r"(?i)(?:^|[^a-z0-9])season[._ -]*(\d{1,2})[._ -]+(\d{1,3})(?!\d)",
+            "season",
+        ),
+        (
+            r"(?i)(?:^|[^a-z0-9])(?:episode|ep)[._ -]*(\d{1,3})(?!\d)",
+            "episode",
+        ),
     )
     for pattern, kind in patterns:
         match = re.search(pattern, text)
