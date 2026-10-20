@@ -17,11 +17,15 @@ def on_activate(app):
   app.set_accels_for_action("app.quit", ["<Primary>q"])
 
   window.ui = UI(window)
+  window.ui.install_notification_actions(app)
   if not hasattr(app, "video_watcher"):
     app.video_watcher = LocalVideoWatcher(
-      app, window.ui.on_local_video_complete
+      app,
+      window.ui.on_local_video_complete,
+      window.ui.completion_threshold,
     )
     window.ui.video_watcher = app.video_watcher
+    app.video_watcher.set_enabled(window.ui.video_detection_enabled)
     app.video_watcher.start()
   window.present()
 

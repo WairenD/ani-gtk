@@ -34,15 +34,33 @@ def is_local_video_url(url):
 
 
 class LocalVideoWatcher:
-    def __init__(self, application, on_video_complete=None):
+    def __init__(self, application, on_video_complete=None, completion_threshold=70):
         self.application = application
         self.on_video_complete = on_video_complete
+        self.enabled = True
+        self.completion_threshold = max(1, min(int(completion_threshold), 100))
         self.connection = None
         self.players = {}
         self.owners = {}
         self.signal_ids = []
+        self.position_timer_id = None
+
+    def set_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.enabled:
+            return
+        self.enabled = enabled
+        if enabled:
+            self.start()
+        else:
+            self.stop()
+
+    def set_completion_threshold(self, threshold):
+        self.completion_threshold = max(1, min(int(threshold), 100))
 
     def start(self):
+        if not self.enabled or self.connection:
+            return
         try:
             self.connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
             self.signal_ids.append(
@@ -81,9 +99,23 @@ class LocalVideoWatcher:
             for name in names:
                 if name.startswith(MPRIS_PREFIX):
                     self.add_player(name)
-            GLib.timeout_add_seconds(5, self.poll_positions)
+            self.position_timer_id = GLib.timeout_add_seconds(
+                5, self.poll_positions
+            )
         except GLib.Error as error:
             print(f"MPRIS video detection unavailable: {error.message}")
+
+    def stop(self):
+        if self.position_timer_id:
+            GLib.source_remove(self.position_timer_id)
+            self.position_timer_id = None
+        if self.connection:
+            for signal_id in self.signal_ids:
+                self.connection.signal_unsubscribe(signal_id)
+        self.signal_ids.clear()
+        self.players.clear()
+        self.owners.clear()
+        self.connection = None
 
     def add_player(self, name):
         if name in self.players or not self.connection:
@@ -158,7 +190,7 @@ class LocalVideoWatcher:
             if current_url != player["completed_url"]:
                 player["notified"] = False
 
-        if player["status"] != "Playing" or player["notified"]:
+        if not self.enabled or player["status"] != "Playing" or player["notified"]:
             return
         metadata = player["metadata"]
         url = unpack_value(metadata.get("xesam:url", ""))
@@ -179,6 +211,8 @@ class LocalVideoWatcher:
     def poll_positions(self):
         if not self.connection:
             return GLib.SOURCE_REMOVE
+        if not self.enabled:
+            return GLib.SOURCE_CONTINUE
         for name, player in list(self.players.items()):
             metadata = player["metadata"]
             url = unpack_value(metadata.get("xesam:url", ""))
@@ -231,10 +265,11 @@ class LocalVideoWatcher:
             ).name
             print(f"Video playback: {title} | {percent:.1f}%", flush=True)
         if (
-            player["status"] != "Playing"
+            not self.enabled
+            or player["status"] != "Playing"
             or latest_url != url
             or latest_duration != duration
-            or position < duration * 0.7
+            or position < duration * self.completion_threshold / 100
             or player["completed_url"] == url
         ):
             return

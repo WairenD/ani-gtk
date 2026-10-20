@@ -15,7 +15,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from anilist import AniListAPI
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk
-from mpris import extract_episode_info, extract_episode_number
+from mpris import VIDEO_EXTENSIONS, extract_episode_info, extract_episode_number
 import pyperclip
 import requests
 from utils import format_date, interpret_html
@@ -41,6 +41,10 @@ class UI:
     def __init__(self, root):
         self.root = root
         self.access_token = read_saved_token()
+        self.video_detection_enabled = read_video_detection_setting()
+        self.completion_threshold = read_completion_threshold()
+        self.confirm_episode_updates = read_confirm_episode_updates()
+        self.pending_episode_updates = {}
         self.current_user = ""
         self.anilist_api = AniListAPI(self.access_token)
         self.list_update_queue = queue.Queue()
@@ -71,6 +75,8 @@ class UI:
             .account-banner { border-radius: 10px; }
             .profile-avatar { border-radius: 8px; }
             .cover-image { border-radius: 10px; }
+            .startup-screen { background-color: #202127; }
+            .startup-status { color: #b8b8c0; }
             frame { border-radius: 8px; }
             entry { background-color: #3c3c3c; color: #ffffff; caret-color: #ffffff; font-size: 15px; padding: 10px; border-radius: 8px; border: 1px solid #555; }
             .library-table-scroll { border-radius: 8px; background-color: #292a33; }
@@ -103,7 +109,6 @@ class UI:
             margin_start=18,
             margin_end=18,
         )
-        self.root.set_child(self.main_container)
 
         self.install_window_actions()
         self.install_titlebar_menu()
@@ -463,6 +468,45 @@ class UI:
             self.category_views[cat] = store
         self.update_library_summary()
 
+        self.root_stack = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE,
+            transition_duration=350,
+            hexpand=True,
+            vexpand=True,
+        )
+        self.root_stack.add_named(self.main_container, "main")
+        self.root_stack.add_named(self.create_startup_screen(), "startup")
+        self.root_stack.set_visible_child_name(
+            "startup" if self.access_token else "main"
+        )
+        self.root.set_child(self.root_stack)
+
+    def create_startup_screen(self):
+        startup_screen = Gtk.Overlay(hexpand=True, vexpand=True)
+        startup_screen.add_css_class("startup-screen")
+
+        content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=18,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
+        )
+        startup_screen.set_child(content)
+
+        spinner = Gtk.Spinner()
+        spinner.set_size_request(36, 36)
+        spinner.start()
+        content.append(spinner)
+
+        self.startup_status = Gtk.Label(label="Restoring your session...")
+        self.startup_status.add_css_class("startup-status")
+        content.append(self.startup_status)
+        return startup_screen
+
+    def show_main_content(self):
+        if self.root_stack.get_visible_child_name() != "main":
+            self.root_stack.set_visible_child_name("main")
+
     def install_window_actions(self):
         login_action = Gio.SimpleAction.new("login", None)
         login_action.connect("activate", lambda *_: self.start_login())
@@ -478,6 +522,9 @@ class UI:
         about_action = Gio.SimpleAction.new("about", None)
         about_action.connect("activate", lambda *_: self.show_about())
         self.root.add_action(about_action)
+        settings_action = Gio.SimpleAction.new("settings", None)
+        settings_action.connect("activate", lambda *_: self.show_settings())
+        self.root.add_action(settings_action)
         application = self.root.get_application()
         application.set_accels_for_action("win.login", ["<Primary>l"])
         application.set_accels_for_action(
@@ -486,6 +533,25 @@ class UI:
 
         self.login_action = login_action
         self.logout_action = logout_action
+
+    def install_notification_actions(self, application):
+        confirm_action = Gio.SimpleAction.new(
+            "confirm-episode", GLib.VariantType.new("s")
+        )
+        confirm_action.connect(
+            "activate", lambda _action, parameter: self.confirm_episode_update(
+                parameter.get_string()
+            )
+        )
+        application.add_action(confirm_action)
+
+        skip_action = Gio.SimpleAction.new("skip-episode", GLib.VariantType.new("s"))
+        skip_action.connect(
+            "activate", lambda _action, parameter: self.skip_episode_update(
+                parameter.get_string()
+            )
+        )
+        application.add_action(skip_action)
 
     def create_menu_model(self):
         menu_model = Gio.Menu()
@@ -503,6 +569,9 @@ class UI:
         help_menu.append("Keyboard Shortcuts", "win.shortcuts")
         help_menu.append("About AniList Library Explorer", "win.about")
         menu_model.append_submenu("Help", help_menu)
+
+        settings_menu = Gio.Menu()
+        menu_model.append("Settings", "win.settings")
 
         return menu_model
 
@@ -554,6 +623,131 @@ class UI:
         about_dialog.set_website_label("AniList")
         about_dialog.set_authors(["AniList Library Explorer contributors"])
         about_dialog.present()
+
+    def show_settings(self):
+        if getattr(self, "settings_window", None):
+            self.settings_window.present()
+            return
+
+        settings_window = Gtk.Window(
+            title="Settings",
+            transient_for=self.root,
+            modal=True,
+            resizable=False,
+        )
+        settings_window.set_default_size(480, 320)
+        settings_window.set_child(self.create_settings_page())
+        settings_window.connect(
+            "close-request", lambda *_: self.clear_settings_window()
+        )
+        self.settings_window = settings_window
+        settings_window.present()
+
+    def create_settings_page(self):
+        page = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=18,
+            margin_top=24,
+            margin_bottom=24,
+            margin_start=24,
+            margin_end=24,
+        )
+        heading = Gtk.Label(label="Playback", xalign=0)
+        heading.add_css_class("title-label")
+        page.append(heading)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        row.append(
+            Gtk.Label(
+                label="Detect local video playback",
+                xalign=0,
+                hexpand=True,
+            )
+        )
+        self.video_detection_switch = Gtk.Switch(
+            active=self.video_detection_enabled,
+            valign=Gtk.Align.CENTER,
+        )
+        self.video_detection_switch.connect(
+            "notify::active", self.on_video_detection_toggled
+        )
+        row.append(self.video_detection_switch)
+        page.append(row)
+
+        threshold_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=16
+        )
+        threshold_label = Gtk.Label(
+            label="Episode completion threshold", xalign=0, hexpand=True
+        )
+        threshold_row.append(threshold_label)
+        adjustment = Gtk.Adjustment(
+            value=self.completion_threshold,
+            lower=1,
+            upper=100,
+            step_increment=1,
+            page_increment=10,
+        )
+        self.completion_threshold_spin = Gtk.SpinButton(
+            adjustment=adjustment, climb_rate=1, digits=0, numeric=True
+        )
+        self.completion_threshold_spin.connect(
+            "value-changed", self.on_completion_threshold_changed
+        )
+        threshold_row.append(self.completion_threshold_spin)
+        threshold_row.append(Gtk.Label(label="%"))
+        page.append(threshold_row)
+
+        confirmation_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=16
+        )
+        confirmation_row.append(
+            Gtk.Label(
+                label="Ask before updating episode progress",
+                xalign=0,
+                hexpand=True,
+            )
+        )
+        self.confirm_episode_switch = Gtk.Switch(
+            active=self.confirm_episode_updates,
+            valign=Gtk.Align.CENTER,
+        )
+        self.confirm_episode_switch.connect(
+            "notify::active", self.on_confirm_episode_toggled
+        )
+        confirmation_row.append(self.confirm_episode_switch)
+        page.append(confirmation_row)
+        page.append(
+            Gtk.Label(
+                label="Detects local videos from compatible media players and can "
+                "update episode progress in AniList.",
+                wrap=True,
+                xalign=0,
+            )
+        )
+        return page
+
+    def on_video_detection_toggled(self, switch, _property):
+        self.video_detection_enabled = switch.get_active()
+        save_video_detection_setting(self.video_detection_enabled)
+        watcher = getattr(self, "video_watcher", None)
+        if watcher:
+            watcher.set_enabled(self.video_detection_enabled)
+
+    def on_completion_threshold_changed(self, spin_button):
+        self.completion_threshold = spin_button.get_value_as_int()
+        save_completion_threshold(self.completion_threshold)
+        watcher = getattr(self, "video_watcher", None)
+        if watcher:
+            watcher.set_completion_threshold(self.completion_threshold)
+
+    def on_confirm_episode_toggled(self, switch, _property):
+        self.confirm_episode_updates = switch.get_active()
+        save_confirm_episode_updates(self.confirm_episode_updates)
+
+    def clear_settings_window(self):
+        self.settings_window = None
+        return False
 
     def update_library_summary(self):
         watching = self.category_views.get("CURRENTLY WATCHING")
@@ -658,11 +852,18 @@ class UI:
             self.oauth_dialog = None
             dialog.destroy()
 
-    def authenticate(self, token):
+    def authenticate(self, token, startup=False):
+        self.startup_session_loading = startup
         self.auth_busy = True
         self.auth_progress.set_visible(True)
         self.auth_spinner.start()
-        self.auth_status_label.set_text("Signing in...")
+        self.auth_status_label.set_text(
+            "Restoring session..."
+            if self.startup_session_loading
+            else "Signing in..."
+        )
+        if startup:
+            self.startup_status.set_text("Restoring your session...")
         self.update_auth_controls()
 
         def load_account():
@@ -706,6 +907,8 @@ class UI:
     def finish_authentication(self, token, result):
         api, viewer, library_entries, avatar_data, banner_data, error = result
         if error:
+            if self.startup_session_loading:
+                self.show_main_content()
             self.auth_busy = False
             self.auth_spinner.stop()
             self.auth_progress.set_visible(False)
@@ -741,12 +944,16 @@ class UI:
         )
         save_token(token)
         self.update_auth_controls()
-        self.auth_status_label.set_text("Loading library...")
-        self.auth_spinner.stop()
-        self.auth_spinner.set_visible(False)
-        self.library_progress_bar.set_fraction(0.0)
-        self.library_progress_bar.set_text("0%")
-        self.library_progress_bar.set_visible(True)
+        if self.startup_session_loading:
+            self.startup_status.set_text("Loading your library...")
+            self.library_progress_bar.set_visible(False)
+        else:
+            self.auth_status_label.set_text("Loading library...")
+            self.auth_spinner.stop()
+            self.auth_spinner.set_visible(False)
+            self.library_progress_bar.set_fraction(0.0)
+            self.library_progress_bar.set_text("0%")
+            self.library_progress_bar.set_visible(True)
         for model in self.category_views.values():
             model.remove_all()
         self.pending_library_entries = library_entries
@@ -769,23 +976,28 @@ class UI:
         self.library_load_index = batch_end
         total_entries = len(self.pending_library_entries)
         fraction = batch_end / total_entries if total_entries else 1.0
-        self.library_progress_bar.set_fraction(fraction)
-        self.library_progress_bar.set_text(f"{round(fraction * 100)}%")
+        if not getattr(self, "startup_session_loading", False):
+            self.library_progress_bar.set_fraction(fraction)
+            self.library_progress_bar.set_text(f"{round(fraction * 100)}%")
 
         if batch_end < total_entries:
             return GLib.SOURCE_CONTINUE
 
         self.library_progress_bar.set_visible(False)
         self.auth_spinner.set_visible(True)
+        self.auth_spinner.stop()
         self.auth_progress.set_visible(False)
         self.pending_library_entries = []
+        if self.startup_session_loading:
+            self.show_main_content()
+        self.startup_session_loading = False
         self.auth_busy = False
         self.update_library_summary()
         self.update_auth_controls()
         return GLib.SOURCE_REMOVE
 
     def load_authenticated_user(self):
-        self.authenticate(self.access_token)
+        self.authenticate(self.access_token, startup=True)
 
     def on_local_video_complete(self, media_title, media_url):
         episode_number = extract_episode_number(media_title) or extract_episode_number(
@@ -821,6 +1033,15 @@ class UI:
                     ):
                         matched_alias_lengths.append(len(normalized_alias))
                         break
+                    if (
+                        alias_tokens[-1].isdigit()
+                        and int(alias_tokens[-1]) == episode_number
+                        and candidate_tokens == alias_tokens[:-1]
+                    ):
+                        matched_alias_lengths.append(
+                            len(" ".join(alias_tokens[:-1]))
+                        )
+                        break
             if matched_alias_lengths:
                 matches.append((max(matched_alias_lengths), anime))
 
@@ -854,6 +1075,21 @@ class UI:
             )
             return True
 
+        if self.confirm_episode_updates:
+            request_id = secrets.token_urlsafe(12)
+            self.pending_episode_updates[request_id] = {
+                "anime": anime,
+                "new_progress": new_progress,
+                "old_progress": anime.watched_episodes,
+                "media_url": media_url,
+            }
+            self.send_episode_confirmation(request_id, anime.title, new_progress)
+            print(
+                f"Episode update awaiting confirmation: {anime.title} "
+                f"episode {new_progress}"
+            )
+            return True
+
         old_progress = anime.watched_episodes
         anime.watched_episodes = new_progress
         anime.progress = (
@@ -879,6 +1115,51 @@ class UI:
             f"Episode update queued: {anime.title} -> episode {new_progress}"
         )
         return True
+
+    def send_episode_confirmation(self, request_id, anime_title, episode_count):
+        notification = Gio.Notification.new("Update AniList episode progress?")
+        notification.set_body(f"{anime_title}: mark episode {episode_count} watched?")
+        notification.set_icon(Gio.ThemedIcon.new("video-x-generic"))
+        notification.add_button(
+            "Update", f"app.confirm-episode('{request_id}')"
+        )
+        notification.add_button("Skip", f"app.skip-episode('{request_id}')")
+        application = self.root.get_application()
+        if application:
+            application.send_notification(
+                f"episode-confirm-{request_id}", notification
+            )
+
+    def confirm_episode_update(self, request_id):
+        pending = self.pending_episode_updates.pop(request_id, None)
+        if not pending:
+            return
+        anime = pending["anime"]
+        new_progress = pending["new_progress"]
+        old_progress = pending["old_progress"]
+        anime.watched_episodes = new_progress
+        anime.progress = (
+            f"{new_progress}/{anime.episodes_total}"
+            if anime.episodes_total > 0
+            else f"{new_progress}/?"
+        )
+        anime.progress_fraction = (
+            min(new_progress / anime.episodes_total, 1.0)
+            if anime.episodes_total > 0
+            else 1.0
+        )
+        self.queue_list_update(
+            anime,
+            "progress",
+            new_progress,
+            old_progress,
+            None,
+            notify=True,
+            retry_video_url=pending["media_url"],
+        )
+
+    def skip_episode_update(self, request_id):
+        self.pending_episode_updates.pop(request_id, None)
 
     def logout(self):
         self.access_token = None
@@ -1411,7 +1692,15 @@ def normalize_title(value):
 
 
 def clean_video_title(value):
-    name = Path(unquote(urlparse(value).path)).stem if "://" in value else value
+    if "://" in value:
+        name = Path(unquote(urlparse(value).path)).stem
+    else:
+        file_path = Path(value)
+        name = (
+            file_path.stem
+            if file_path.suffix.lower() in VIDEO_EXTENSIONS
+            else value
+        )
     episode_info = extract_episode_info(name)
     season = episode_info[0] if episode_info else None
     season_label = f" season {season} " if season else " "
@@ -1423,6 +1712,7 @@ def clean_video_title(value):
         name,
     )
     name = re.sub(r"(?i)[ ._-]*(?:episode|ep)[ ._-]*\d{1,3}\b", " ", name)
+    name = re.sub(r"(?i)[ ._-]+e[ ._-]*\d{1,3}\b", " ", name)
     name = re.sub(r"(?i)[ ._-]+\d{1,3}(?=[ ._-]|$)", " ", name)
     name = re.sub(
         r"(?i)[ ._-]+(?:\d{3,4}p|web[ ._-]?dl|bluray|h\.?26[45]|x26[45]).*$",
@@ -1469,6 +1759,60 @@ def banner_texture_from_image_data(image_data, width, height):
 def session_config_path():
     config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return config_home / "ani-gtk" / "session.ini"
+
+
+def preferences_config_path():
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_home / "ani-gtk" / "settings.ini"
+
+
+def read_video_detection_setting():
+    return read_preference("video_detection_enabled", True, "getboolean")
+
+
+def read_completion_threshold():
+    try:
+        return max(1, min(read_preference("completion_threshold", 70, "getint"), 100))
+    except (TypeError, ValueError):
+        return 70
+
+
+def read_confirm_episode_updates():
+    return read_preference("confirm_episode_updates", False, "getboolean")
+
+
+def read_preference(key, fallback, getter):
+    config = configparser.ConfigParser()
+    try:
+        config.read(preferences_config_path())
+        return getattr(config, getter)("PREFERENCES", key, fallback=fallback)
+    except (OSError, configparser.Error):
+        return fallback
+
+
+def save_preference(key, value):
+    path = preferences_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config = configparser.ConfigParser()
+    config.read(path)
+    if "PREFERENCES" not in config:
+        config["PREFERENCES"] = {}
+    config["PREFERENCES"][key] = str(value)
+    with path.open("w") as settings_file:
+        config.write(settings_file)
+    path.chmod(0o600)
+
+
+def save_video_detection_setting(enabled):
+    save_preference("video_detection_enabled", bool(enabled))
+
+
+def save_completion_threshold(threshold):
+    save_preference("completion_threshold", max(1, min(int(threshold), 100)))
+
+
+def save_confirm_episode_updates(enabled):
+    save_preference("confirm_episode_updates", bool(enabled))
 
 
 def read_saved_token():
