@@ -1,5 +1,5 @@
 pkgname=ani-gtk
-pkgver=0.1.0
+pkgver=0.2.0.r0.7ed54c0
 pkgrel=1
 pkgdesc='GTK 4 AniList library explorer with local video progress tracking'
 arch=('any')
@@ -12,12 +12,17 @@ depends=(
   'python-pyperclip'
   'python-requests'
 )
-source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+source=("${pkgname}::git+${url}.git#branch=main")
 sha256sums=('SKIP')
 backup=('etc/ani-gtk/config.ini')
 
+pkgver() {
+  cd "${srcdir}/${pkgname}"
+  git describe --long --tags --abbrev=7 | sed 's/^v//; s/-/.r/; s/-g/./'
+}
+
 package() {
-  cd "${srcdir}/${pkgname}-${pkgver}"
+  cd "${srcdir}/${pkgname}"
 
   install -d "${pkgdir}/usr/lib/${pkgname}/src"
   install -m 644 src/*.py "${pkgdir}/usr/lib/${pkgname}/src/"
