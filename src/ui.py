@@ -29,6 +29,7 @@ class AnimeItem(GObject.GObject):
     score = GObject.Property(type=int, default=0)
     format_type = GObject.Property(type=str, default="")
     anime_id = GObject.Property(type=str, default="")
+    folder_path = GObject.Property(type=str, default="")
     episodes_total = GObject.Property(type=int, default=0)
     watched_episodes = GObject.Property(type=int, default=0)
 
@@ -300,6 +301,13 @@ class UI:
             col_view = Gtk.ColumnView(
                 model=selection_model, vexpand=True, hexpand=True
             )
+            col_view.set_single_click_activate(False)
+            col_view.connect(
+                "activate",
+                lambda _view, position, model=selection_model: self.play_anime(
+                    model.get_item(position)
+                ),
+            )
             col_view.set_show_column_separators(True)
             sort_model.set_sorter(col_view.get_sorter())
 
@@ -322,6 +330,7 @@ class UI:
             progress_sorter = Gtk.CustomSorter.new(compare_progress, None)
 
             columns_data = [
+                ("", "folder", 36, False, None),
                 ("Title", "title", 240, True, title_sorter),
                 ("Progress", "progress_fraction", 170, False, progress_sorter),
                 ("Score", "score", 90, False, score_sorter),
@@ -331,7 +340,45 @@ class UI:
             ui_instance = self
             for col_title, prop, width, expand_val, sorter in columns_data:
                 factory = Gtk.SignalListItemFactory()
-                if prop == "progress_fraction":
+                if prop == "folder":
+
+                    def setup_folder(factory, item):
+                        icon = Gtk.Image.new_from_icon_name("folder-symbolic")
+                        icon.set_halign(Gtk.Align.CENTER)
+                        item.set_child(icon)
+
+                    def bind_folder(factory, item):
+                        icon = item.get_child()
+                        previous_anime = getattr(icon, "bound_anime", None)
+                        previous_handler = getattr(icon, "folder_handler", None)
+                        if previous_anime and previous_handler:
+                            previous_anime.disconnect(previous_handler)
+                        anime = item.get_item()
+                        icon.bound_anime = anime
+
+                        def update_folder_icon(*_args):
+                            icon.set_visible(bool(anime.folder_path))
+                            icon.set_tooltip_text(anime.folder_path or None)
+
+                        icon.folder_handler = anime.connect(
+                            "notify::folder-path", update_folder_icon
+                        )
+                        update_folder_icon()
+
+                    def unbind_folder(factory, item):
+                        icon = item.get_child()
+                        anime = getattr(icon, "bound_anime", None)
+                        handler = getattr(icon, "folder_handler", None)
+                        if anime and handler:
+                            anime.disconnect(handler)
+                        icon.bound_anime = None
+                        icon.folder_handler = None
+
+                    factory.connect("setup", setup_folder)
+                    factory.connect("bind", bind_folder)
+                    factory.connect("unbind", unbind_folder)
+
+                elif prop == "progress_fraction":
 
                     def setup_progress(factory, item):
                         box = Gtk.Box(
@@ -437,12 +484,23 @@ class UI:
                     factory.connect("setup", setup_score)
                     factory.connect("bind", bind_score)
                 else:
-                    factory.connect(
-                        "setup",
-                        lambda _, item: item.set_child(
-                            Gtk.Label(xalign=0, margin_start=10)
-                        ),
-                    )
+                    def setup_label(factory, item, item_prop=prop):
+                        label = Gtk.Label(xalign=0, margin_start=10)
+                        if item_prop == "title":
+                            click = Gtk.GestureClick(button=3)
+                            click.connect(
+                                "pressed",
+                                lambda gesture, _count, x, y, list_item=item: ui_instance.show_anime_context_menu(
+                                    label,
+                                    list_item.get_item(),
+                                    x,
+                                    y,
+                                ),
+                            )
+                            label.add_controller(click)
+                        item.set_child(label)
+
+                    factory.connect("setup", setup_label)
                     factory.connect(
                         "bind",
                         lambda _, item, p=prop: item.get_child().set_text(
@@ -872,40 +930,15 @@ class UI:
                 viewer = api.fetch_viewer()
                 media_lists = api.fetch_media_list(viewer["id"])
                 library_entries = prepare_media_entries(media_lists)
-                avatar_data = None
-                avatar_url = viewer.get("avatar", {}).get("large")
-                if avatar_url:
-                    try:
-                        avatar_response = requests.get(avatar_url, timeout=15)
-                        avatar_response.raise_for_status()
-                        avatar_data = avatar_response.content
-                    except requests.RequestException:
-                        pass
-                banner_data = None
-                banner_url = viewer.get("bannerImage")
-                if banner_url:
-                    try:
-                        banner_response = requests.get(banner_url, timeout=15)
-                        banner_response.raise_for_status()
-                        banner_data = banner_response.content
-                    except requests.RequestException:
-                        pass
-                result = (
-                    api,
-                    viewer,
-                    library_entries,
-                    avatar_data,
-                    banner_data,
-                    None,
-                )
+                result = (api, viewer, library_entries, None)
             except Exception as error:
-                result = (None, None, None, None, None, error)
+                result = (None, None, None, error)
             GLib.idle_add(self.finish_authentication, token, result)
 
         Thread(target=load_account, daemon=True).start()
 
     def finish_authentication(self, token, result):
-        api, viewer, library_entries, avatar_data, banner_data, error = result
+        api, viewer, library_entries, error = result
         if error:
             if self.startup_session_loading:
                 self.show_main_content()
@@ -926,22 +959,11 @@ class UI:
         self.anilist_api = api
         self.access_token = token
         self.current_user = viewer["name"]
-        if avatar_data:
-            try:
-                loader = GdkPixbuf.PixbufLoader.new()
-                loader.write(avatar_data)
-                loader.close()
-                self.avatar_picture.set_paintable(
-                    Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
-                )
-                self.avatar_stack.set_visible_child_name("profile")
-            except Exception:
-                self.avatar_stack.set_visible_child_name("default")
-        self.banner_picture.set_paintable(
-            banner_texture_from_image_data(banner_data, 1600, 96)
-            if banner_data
-            else None
-        )
+        Thread(
+            target=self.load_profile_images,
+            args=(token, viewer),
+            daemon=True,
+        ).start()
         save_token(token)
         self.update_auth_controls()
         if self.startup_session_loading:
@@ -961,6 +983,41 @@ class UI:
         GLib.idle_add(self.append_library_batch)
         return GLib.SOURCE_REMOVE
 
+    def load_profile_images(self, token, viewer):
+        image_data = []
+        for url in (viewer.get("avatar", {}).get("large"), viewer.get("bannerImage")):
+            try:
+                response = requests.get(url, timeout=15) if url else None
+                if response:
+                    response.raise_for_status()
+                    image_data.append(response.content)
+                else:
+                    image_data.append(None)
+            except requests.RequestException:
+                image_data.append(None)
+        GLib.idle_add(self.finish_profile_images, token, *image_data)
+
+    def finish_profile_images(self, token, avatar_data, banner_data):
+        if token != self.access_token:
+            return GLib.SOURCE_REMOVE
+        if avatar_data:
+            try:
+                loader = GdkPixbuf.PixbufLoader.new()
+                loader.write(avatar_data)
+                loader.close()
+                self.avatar_picture.set_paintable(
+                    Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
+                )
+                self.avatar_stack.set_visible_child_name("profile")
+            except Exception:
+                self.avatar_stack.set_visible_child_name("default")
+        self.banner_picture.set_paintable(
+            banner_texture_from_image_data(banner_data, 1600, 96)
+            if banner_data
+            else None
+        )
+        return GLib.SOURCE_REMOVE
+
     def append_library_batch(self):
         batch_size = 40
         batch_end = min(
@@ -972,7 +1029,12 @@ class UI:
         ]:
             model = self.category_views.get(category)
             if model is not None:
-                model.append(AnimeItem(**item_data))
+                model.append(
+                    AnimeItem(
+                        **item_data,
+                        folder_path=read_anime_folder(item_data["anime_id"]),
+                    )
+                )
         self.library_load_index = batch_end
         total_entries = len(self.pending_library_entries)
         fraction = batch_end / total_entries if total_entries else 1.0
@@ -1091,17 +1153,7 @@ class UI:
             return True
 
         old_progress = anime.watched_episodes
-        anime.watched_episodes = new_progress
-        anime.progress = (
-            f"{new_progress}/{anime.episodes_total}"
-            if anime.episodes_total > 0
-            else f"{new_progress}/?"
-        )
-        anime.progress_fraction = (
-            min(new_progress / anime.episodes_total, 1.0)
-            if anime.episodes_total > 0
-            else 1.0
-        )
+        self.set_anime_progress(anime, new_progress)
         self.queue_list_update(
             anime,
             "progress",
@@ -1137,17 +1189,7 @@ class UI:
         anime = pending["anime"]
         new_progress = pending["new_progress"]
         old_progress = pending["old_progress"]
-        anime.watched_episodes = new_progress
-        anime.progress = (
-            f"{new_progress}/{anime.episodes_total}"
-            if anime.episodes_total > 0
-            else f"{new_progress}/?"
-        )
-        anime.progress_fraction = (
-            min(new_progress / anime.episodes_total, 1.0)
-            if anime.episodes_total > 0
-            else 1.0
-        )
+        new_progress = self.set_anime_progress(anime, new_progress)
         self.queue_list_update(
             anime,
             "progress",
@@ -1179,24 +1221,26 @@ class UI:
 
     def adjust_progress(self, anime, delta, box):
         previous = anime.watched_episodes
-        new_watched = max(0, anime.watched_episodes + delta)
-        if anime.episodes_total > 0:
-            if new_watched > anime.episodes_total:
-                new_watched = anime.episodes_total
-            anime.progress_fraction = min(
-                max(new_watched / anime.episodes_total, 0.0), 1.0
-            )
-            anime.progress = f"{new_watched}/{anime.episodes_total}"
-        else:
-            anime.progress_fraction = 1.0
-            anime.progress = f"{new_watched}/?"
-
-        anime.watched_episodes = new_watched
+        new_watched = self.set_anime_progress(
+            anime, anime.watched_episodes + delta
+        )
         box.pbar.set_fraction(anime.progress_fraction)
         box.pbar.set_text(anime.progress)
         self.queue_list_update(
             anime, "progress", new_watched, previous, box
         )
+
+    def set_anime_progress(self, anime, watched):
+        watched = max(0, int(watched))
+        if anime.episodes_total > 0:
+            watched = min(watched, anime.episodes_total)
+            anime.progress_fraction = watched / anime.episodes_total
+            anime.progress = f"{watched}/{anime.episodes_total}"
+        else:
+            anime.progress_fraction = 1.0
+            anime.progress = f"{watched}/?"
+        anime.watched_episodes = watched
+        return watched
 
     def on_score_changed(self, dropdown):
         if getattr(dropdown, "is_binding", False):
@@ -1210,6 +1254,122 @@ class UI:
             return
         anime.score = new_score
         self.queue_list_update(anime, "score", new_score, previous, dropdown)
+
+    def play_anime(self, anime):
+        if not anime:
+            return
+        folder = read_anime_folder(anime.anime_id)
+        if folder and Path(folder).is_dir():
+            self.play_next_episode(anime, Path(folder))
+            return
+        self.choose_anime_folder(anime, play_after_selection=True)
+
+    def choose_anime_folder(self, anime, play_after_selection=False):
+        chooser = Gtk.FileChooserNative(
+            title=f"Select folder for {anime.title}",
+            transient_for=self.root,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+            accept_label="Select",
+            cancel_label="Cancel",
+        )
+        chooser.connect(
+            "response", self.on_anime_folder_selected, anime, play_after_selection
+        )
+        chooser.show()
+
+    def on_anime_folder_selected(
+        self, chooser, response, anime, play_after_selection
+    ):
+        if response == Gtk.ResponseType.ACCEPT:
+            selected = chooser.get_file()
+            folder = selected.get_path() if selected else None
+            if folder:
+                save_anime_folder(anime.anime_id, folder)
+                anime.folder_path = folder
+                if play_after_selection:
+                    self.play_next_episode(anime, Path(folder))
+        chooser.destroy()
+
+    def show_anime_context_menu(self, widget, anime, x, y):
+        if not anime:
+            return
+        popover = Gtk.Popover()
+        actions = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=2,
+            margin_top=6,
+            margin_bottom=6,
+            margin_start=6,
+            margin_end=6,
+        )
+        for label, callback in (
+            (
+                "Select anime folder…",
+                lambda: self.choose_anime_folder(anime),
+            ),
+            ("Play next episode", lambda: self.play_anime(anime)),
+        ):
+            button = Gtk.Button(label=label, has_frame=False, hexpand=True)
+            button.connect("clicked", lambda _button, run=callback: run())
+            actions.append(button)
+        popover.set_child(actions)
+        popover.set_parent(widget)
+        pointing = Gdk.Rectangle()
+        pointing.x = int(x)
+        pointing.y = int(y)
+        pointing.width = 1
+        pointing.height = 1
+        popover.set_pointing_to(pointing)
+        popover.connect("closed", lambda current: current.unparent())
+        popover.popup()
+
+    def play_next_episode(self, anime, folder):
+        next_episode = anime.watched_episodes + 1
+        Thread(
+            target=self.find_episode_file,
+            args=(anime, folder, next_episode),
+            daemon=True,
+        ).start()
+
+    def find_episode_file(self, anime, folder, episode_number):
+        numbered_files = []
+        try:
+            for path in folder.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                episode_info = extract_episode_info(path.name)
+                if episode_info:
+                    season, number = episode_info
+                    numbered_files.append((season or 1, number, path))
+        except OSError as error:
+            GLib.idle_add(self.show_error, "Folder Scan Error", str(error))
+            return
+        numbered_files.sort(
+            key=lambda item: (item[0], item[1], item[2].name.casefold())
+        )
+        episode_file = next(
+            (path for _season, number, path in numbered_files if number == episode_number),
+            None,
+        )
+        if episode_file is None and any(season > 1 for season, _number, _path in numbered_files):
+            if episode_number <= len(numbered_files):
+                episode_file = numbered_files[episode_number - 1][2]
+        GLib.idle_add(
+            self.finish_episode_search, anime, folder, episode_number, episode_file
+        )
+
+    def finish_episode_search(self, anime, folder, episode_number, episode_file):
+        if not episode_file:
+            self.show_error(
+                "Episode Not Found",
+                f"Could not find episode {episode_number} in {folder}.",
+            )
+            return GLib.SOURCE_REMOVE
+        try:
+            Gio.AppInfo.launch_default_for_uri(episode_file.as_uri(), None)
+        except GLib.Error as error:
+            self.show_error("Playback Error", str(error))
+        return GLib.SOURCE_REMOVE
 
     def queue_list_update(
         self,
@@ -1333,15 +1493,7 @@ class UI:
 
     def restore_list_value(self, anime, field, value, widget):
         if field == "progress":
-            anime.watched_episodes = value
-            if anime.episodes_total > 0:
-                anime.progress_fraction = min(
-                    max(value / anime.episodes_total, 0.0), 1.0
-                )
-                anime.progress = f"{value}/{anime.episodes_total}"
-            else:
-                anime.progress = f"{value}/?"
-                anime.progress_fraction = 1.0
+            self.set_anime_progress(anime, value)
             if getattr(widget, "anime", None) is anime:
                 widget.pbar.set_fraction(anime.progress_fraction)
                 widget.pbar.set_text(anime.progress)
@@ -1419,6 +1571,10 @@ class UI:
             editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD
         )
         self.right_text_view.set_overflow(Gtk.Overflow.HIDDEN)
+        self.right_text_view.set_left_margin(16)
+        self.right_text_view.set_right_margin(16)
+        self.right_text_view.set_top_margin(12)
+        self.right_text_view.set_bottom_margin(12)
         self.right_text_buffer = self.right_text_view.get_buffer()
         self.right_text_buffer.create_tag("desc_font", font="Helvetica 16")
 
@@ -1779,6 +1935,18 @@ def read_completion_threshold():
 
 def read_confirm_episode_updates():
     return read_preference("confirm_episode_updates", False, "getboolean")
+
+
+def anime_folder_preference_key(anime_id):
+    return f"anime_folder_{anime_id}"
+
+
+def read_anime_folder(anime_id):
+    return read_preference(anime_folder_preference_key(anime_id), "", "get")
+
+
+def save_anime_folder(anime_id, folder):
+    save_preference(anime_folder_preference_key(anime_id), folder)
 
 
 def read_preference(key, fallback, getter):

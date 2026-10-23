@@ -2,7 +2,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gio, Gtk
+from gi.repository import Gio, GLib, Gtk
 from mpris import LocalVideoWatcher
 from ui import UI
 
@@ -26,7 +26,7 @@ def on_activate(app):
     )
     window.ui.video_watcher = app.video_watcher
     app.video_watcher.set_enabled(window.ui.video_detection_enabled)
-    app.video_watcher.start()
+    GLib.timeout_add_seconds(1, app.video_watcher.start)
   window.present()
 
 

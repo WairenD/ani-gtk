@@ -73,23 +73,6 @@ class AniListAPI:
                             synonyms
                             format
                             episodes
-                            duration
-                            startDate {
-                                year
-                                month
-                                day
-                            }
-                            endDate {
-                                year
-                                month
-                                day
-                            }
-                            averageScore
-                            popularity
-                            description
-                            coverImage {
-                                large
-                            }
                         }
                         progress
                         score
