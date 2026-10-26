@@ -287,11 +287,11 @@ class UI:
         self.category_views = {}
         categories = [
             "CURRENTLY WATCHING",
+            "REWATCHING",
             "COMPLETED",
             "DROPPED",
             "PLAN TO WATCH",
             "PAUSED",
-            "REWATCHING",
         ]
 
         for cat in categories:
@@ -334,8 +334,16 @@ class UI:
 
             progress_sorter = Gtk.CustomSorter.new(compare_progress, None)
 
+            # ADD THIS: Sorter for the folder column (sorts items with a folder path first/last)
+            def compare_folder(item1, item2, *args):
+                has_folder_1 = bool(item1.folder_path)
+                has_folder_2 = bool(item2.folder_path)
+                return (has_folder_1 > has_folder_2) - (has_folder_1 < has_folder_2)
+
+            folder_sorter = Gtk.CustomSorter.new(compare_folder, None)
+
             columns_data = [
-                ("", "folder", 36, False, None),
+                ("", "folder", 36, False, folder_sorter),
                 ("Title", "title", 240, True, title_sorter),
                 ("Progress", "progress_fraction", 170, False, progress_sorter),
                 ("Score", "score", 90, False, score_sorter),
@@ -1146,45 +1154,55 @@ class UI:
             for candidate in candidates
         }
         matches = []
-        watching_store = self.category_views.get("CURRENTLY WATCHING")
-        if watching_store is None or watching_store.get_n_items() == 0:
-            print("Episode update deferred: Currently Watching list is empty")
+        
+        # Check both "CURRENTLY WATCHING" and "REWATCHING" categories
+        stores_to_check = [
+            self.category_views.get("CURRENTLY WATCHING"),
+            self.category_views.get("REWATCHING"),
+        ]
+        
+        if all(store is None or store.get_n_items() == 0 for store in stores_to_check):
+            print("Episode update deferred: Currently Watching and Rewatching lists are empty")
             return False
-        for index in range(watching_store.get_n_items()):
-            anime = watching_store.get_item(index)
-            aliases = [anime.title, *anime.title_aliases.split("\n")]
-            matched_alias_lengths = []
-            for alias in aliases:
-                normalized_alias = normalize_title(alias)
-                if len(normalized_alias) < 4:
-                    continue
-                alias_tokens = normalized_alias.split()
-                for candidate in normalized_candidates:
-                    candidate_tokens = candidate.split()
-                    if normalized_alias in candidate or all(
-                        token in candidate_tokens for token in alias_tokens
-                    ):
-                        matched_alias_lengths.append(len(normalized_alias))
-                        break
-                    if (
-                        alias_tokens[-1].isdigit()
-                        and int(alias_tokens[-1]) == episode_number
-                        and candidate_tokens == alias_tokens[:-1]
-                    ):
-                        matched_alias_lengths.append(
-                            len(" ".join(alias_tokens[:-1]))
-                        )
-                        break
-            if matched_alias_lengths:
-                matches.append((max(matched_alias_lengths), anime))
+
+        for store in stores_to_check:
+            if store is None:
+                continue
+            for index in range(store.get_n_items()):
+                anime = store.get_item(index)
+                aliases = [anime.title, *anime.title_aliases.split("\n")]
+                matched_alias_lengths = []
+                for alias in aliases:
+                    normalized_alias = normalize_title(alias)
+                    if len(normalized_alias) < 4:
+                        continue
+                    alias_tokens = normalized_alias.split()
+                    for candidate in normalized_candidates:
+                        candidate_tokens = candidate.split()
+                        if normalized_alias in candidate or all(
+                            token in candidate_tokens for token in alias_tokens
+                        ):
+                            matched_alias_lengths.append(len(normalized_alias))
+                            break
+                        if (
+                            alias_tokens[-1].isdigit()
+                            and int(alias_tokens[-1]) == episode_number
+                            and candidate_tokens == alias_tokens[:-1]
+                        ):
+                            matched_alias_lengths.append(
+                                len(" ".join(alias_tokens[:-1]))
+                            )
+                            break
+                if matched_alias_lengths:
+                    matches.append((max(matched_alias_lengths), anime))
 
         if not matches:
-            considered = [
-                watching_store.get_item(index).title
-                for index in range(watching_store.get_n_items())
-            ]
+            considered = []
+            for store in stores_to_check:
+                if store:
+                    considered.extend([store.get_item(i).title for i in range(store.get_n_items())])
             print(
-                f"Episode update skipped: no Currently Watching title matched "
+                f"Episode update skipped: no Currently Watching or Rewatching title matched "
                 f"'{media_title}' (episode {episode_number}); titles: {considered}"
             )
             return False
@@ -1193,7 +1211,7 @@ class UI:
         if len(best_matches) != 1:
             print(
                 f"Episode update skipped: title '{media_title}' matched multiple "
-                "Currently Watching entries"
+                "Currently Watching or Rewatching entries"
             )
             return False
 
@@ -1351,6 +1369,18 @@ class UI:
         )
         chooser.show()
 
+    def open_anime_folder(self, anime):
+            if not anime:
+                return
+            folder = anime.folder_path or read_anime_folder(anime.anime_id)
+            if folder and Path(folder).is_dir():
+                try:
+                    Gio.AppInfo.launch_default_for_uri(Path(folder).as_uri(), None)
+                except GLib.Error as error:
+                    self.show_error("Folder Error", str(error))
+            else:
+                self.choose_anime_folder(anime, play_after_selection=False)
+
     def on_anime_folder_selected(
         self, chooser, response, anime, play_after_selection
     ):
@@ -1377,6 +1407,10 @@ class UI:
             margin_end=6,
         )
         for label, callback in (
+            (
+                "Open anime folder",
+                lambda: self.open_anime_folder(anime),
+            ),
             (
                 "Select anime folder…",
                 lambda: self.choose_anime_folder(anime),
