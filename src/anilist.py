@@ -5,15 +5,15 @@ class AniListAPI:
     def __init__(self, access_token=None):
         self.base_url = "https://graphql.anilist.co"
         self.access_token = access_token
+        self._session = requests.Session()
+        self._session.headers["Content-Type"] = "application/json"
+        if access_token:
+            self._session.headers["Authorization"] = f"Bearer {access_token}"
 
     def _post(self, query, variables):
-        headers = {}
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        response = requests.post(
+        response = self._session.post(
             self.base_url,
             json={"query": query, "variables": variables},
-            headers=headers,
             timeout=30,
         )
         response.raise_for_status()
@@ -21,6 +21,12 @@ class AniListAPI:
         if payload.get("errors"):
             raise RuntimeError(payload["errors"][0].get("message", "AniList API error"))
         return payload["data"]
+
+    def download(self, url, timeout=15):
+        """Download arbitrary URL reusing the pooled session."""
+        response = self._session.get(url, timeout=timeout)
+        response.raise_for_status()
+        return response.content
 
     def fetch_viewer(self):
         query = """

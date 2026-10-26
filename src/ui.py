@@ -4,7 +4,9 @@ import json
 import os
 import queue
 import re
+import threading
 import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
@@ -17,7 +19,6 @@ from anilist import AniListAPI
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk
 from mpris import VIDEO_EXTENSIONS, extract_episode_info, extract_episode_number
 import pyperclip
-import requests
 from utils import format_date, interpret_html
 
 
@@ -48,6 +49,10 @@ class UI:
         self.pending_episode_updates = {}
         self.current_user = ""
         self.anilist_api = AniListAPI(self.access_token)
+        self._anime_info_cache = {}
+        self._cover_texture_cache = {}
+        self._cover_bytes_cache = {}
+        self._details_request_id = 0
         self.list_update_queue = queue.Queue()
         Thread(target=self.process_list_update_queue, daemon=True).start()
         self.root.set_title("AniList Library Explorer")
@@ -574,6 +579,10 @@ class UI:
         logout_action.connect("activate", lambda *_: self.logout())
         self.root.add_action(logout_action)
 
+        refresh_action = Gio.SimpleAction.new("refresh", None)
+        refresh_action.connect("activate", lambda *_: self.refresh_library())
+        self.root.add_action(refresh_action)
+
         shortcuts_action = Gio.SimpleAction.new("shortcuts", None)
         shortcuts_action.connect("activate", lambda *_: self.show_shortcuts())
         self.root.add_action(shortcuts_action)
@@ -585,12 +594,14 @@ class UI:
         self.root.add_action(settings_action)
         application = self.root.get_application()
         application.set_accels_for_action("win.login", ["<Primary>l"])
+        application.set_accels_for_action("win.refresh", ["<Primary>r"])
         application.set_accels_for_action(
             "win.shortcuts", ["<Primary>question"]
         )
 
         self.login_action = login_action
         self.logout_action = logout_action
+        self.refresh_action = refresh_action
 
     def install_notification_actions(self, application):
         confirm_action = Gio.SimpleAction.new(
@@ -621,6 +632,7 @@ class UI:
         account_menu = Gio.Menu()
         account_menu.append("Login with AniList", "win.login")
         account_menu.append("Log out", "win.logout")
+        account_menu.append("Refresh Library", "win.refresh")
         menu_model.append_submenu("Account", account_menu)
 
         help_menu = Gio.Menu()
@@ -645,6 +657,18 @@ class UI:
         menu_button.set_menu_model(self.create_menu_model())
         menu_button.set_tooltip_text("Application menu")
         titlebar.pack_start(menu_button)
+
+        self.refresh_button = Gtk.Button()
+        self.refresh_button.set_icon_name("view-refresh-symbolic")
+        self.refresh_button.set_tooltip_text("Refresh library (Ctrl+R)")
+        self.refresh_button.connect("clicked", lambda *_: self.refresh_library())
+        titlebar.pack_start(self.refresh_button)
+
+        self.refresh_spinner = Gtk.Spinner()
+        self.refresh_spinner.set_size_request(20, 20)
+        self.refresh_spinner.set_visible(False)
+        titlebar.pack_start(self.refresh_spinner)
+
         self.root.set_titlebar(titlebar)
 
     def show_shortcuts(self):
@@ -657,6 +681,11 @@ class UI:
         group.add_shortcut(
             Gtk.ShortcutsShortcut(
                 title="Log in with AniList", accelerator="<Primary>l"
+            )
+        )
+        group.add_shortcut(
+            Gtk.ShortcutsShortcut(
+                title="Refresh library", accelerator="<Primary>r"
             )
         )
         group.add_shortcut(
@@ -823,13 +852,18 @@ class UI:
     def update_auth_controls(self):
         signed_in = bool(self.access_token)
         busy = getattr(self, "auth_busy", False)
+        refreshing = getattr(self, "refresh_busy", False)
         self.login_button.set_visible(not signed_in)
         self.login_button.set_sensitive(not busy)
         self.logout_button.set_visible(signed_in)
-        self.logout_button.set_sensitive(not busy)
+        self.logout_button.set_sensitive(not busy and not refreshing)
         if hasattr(self, "login_action"):
             self.login_action.set_enabled(not signed_in and not busy)
-            self.logout_action.set_enabled(signed_in and not busy)
+            self.logout_action.set_enabled(signed_in and not busy and not refreshing)
+        if hasattr(self, "refresh_action"):
+            self.refresh_action.set_enabled(signed_in and not busy and not refreshing)
+        if hasattr(self, "refresh_button"):
+            self.refresh_button.set_sensitive(signed_in and not busy and not refreshing)
         if not signed_in:
             self.avatar_stack.set_visible_child_name("default")
 
@@ -978,22 +1012,42 @@ class UI:
             self.library_progress_bar.set_visible(True)
         for model in self.category_views.values():
             model.remove_all()
-        self.pending_library_entries = library_entries
-        self.library_load_index = 0
-        GLib.idle_add(self.append_library_batch)
+        self._populate_library(library_entries)
         return GLib.SOURCE_REMOVE
 
+    def _populate_library(self, library_entries):
+        """Bulk-insert all library entries using splice for minimal UI churn."""
+        buckets = {cat: [] for cat in self.category_views}
+        for category, item_data in library_entries:
+            if category in buckets:
+                buckets[category].append(
+                    AnimeItem(
+                        **item_data,
+                        folder_path=_read_anime_folder_cached(item_data["anime_id"]),
+                    )
+                )
+        for category, items in buckets.items():
+            store = self.category_views[category]
+            if items:
+                store.splice(0, store.get_n_items(), items)
+        self.library_progress_bar.set_visible(False)
+        self.auth_spinner.set_visible(True)
+        self.auth_spinner.stop()
+        self.auth_progress.set_visible(False)
+        if getattr(self, "startup_session_loading", False):
+            self.show_main_content()
+        self.startup_session_loading = False
+        self.auth_busy = False
+        self.update_library_summary()
+        self.update_auth_controls()
+
     def load_profile_images(self, token, viewer):
+        api = self.anilist_api
         image_data = []
         for url in (viewer.get("avatar", {}).get("large"), viewer.get("bannerImage")):
             try:
-                response = requests.get(url, timeout=15) if url else None
-                if response:
-                    response.raise_for_status()
-                    image_data.append(response.content)
-                else:
-                    image_data.append(None)
-            except requests.RequestException:
+                image_data.append(api.download(url) if url else None)
+            except Exception:
                 image_data.append(None)
         GLib.idle_add(self.finish_profile_images, token, *image_data)
 
@@ -1018,42 +1072,59 @@ class UI:
         )
         return GLib.SOURCE_REMOVE
 
-    def append_library_batch(self):
-        batch_size = 40
-        batch_end = min(
-            self.library_load_index + batch_size,
-            len(self.pending_library_entries),
-        )
-        for category, item_data in self.pending_library_entries[
-            self.library_load_index:batch_end
-        ]:
-            model = self.category_views.get(category)
-            if model is not None:
-                model.append(
+    def refresh_library(self):
+        if not self.access_token:
+            self.show_error("Not signed in", "Log in to refresh your library.")
+            return
+        if getattr(self, "auth_busy", False) or getattr(self, "refresh_busy", False):
+            return
+        self.refresh_busy = True
+        self.refresh_button.set_sensitive(False)
+        self.refresh_spinner.set_visible(True)
+        self.refresh_spinner.start()
+        self.update_auth_controls()
+        token = self.access_token
+
+        def do_refresh():
+            try:
+                api = self.anilist_api
+                viewer = api.fetch_viewer()
+                media_lists = api.fetch_media_list(viewer["id"])
+                library_entries = prepare_media_entries(media_lists)
+                result = (library_entries, None)
+            except Exception as error:
+                result = (None, error)
+            GLib.idle_add(self.finish_refresh, token, result)
+
+        Thread(target=do_refresh, daemon=True).start()
+
+    def finish_refresh(self, token, result):
+        library_entries, error = result
+        self.refresh_spinner.stop()
+        self.refresh_spinner.set_visible(False)
+        self.refresh_busy = False
+        if token != self.access_token:
+            self.update_auth_controls()
+            return GLib.SOURCE_REMOVE
+        if error:
+            self.update_auth_controls()
+            self.show_error("Refresh Failed", f"Could not refresh your library: {error}")
+            return GLib.SOURCE_REMOVE
+        self._anime_info_cache.clear()
+        self._cover_texture_cache.clear()
+        self._cover_bytes_cache.clear()
+        buckets = {cat: [] for cat in self.category_views}
+        for category, item_data in library_entries:
+            if category in buckets:
+                buckets[category].append(
                     AnimeItem(
                         **item_data,
-                        folder_path=read_anime_folder(item_data["anime_id"]),
+                        folder_path=_read_anime_folder_cached(item_data["anime_id"]),
                     )
                 )
-        self.library_load_index = batch_end
-        total_entries = len(self.pending_library_entries)
-        fraction = batch_end / total_entries if total_entries else 1.0
-        if not getattr(self, "startup_session_loading", False):
-            self.library_progress_bar.set_fraction(fraction)
-            self.library_progress_bar.set_text(f"{round(fraction * 100)}%")
-
-        if batch_end < total_entries:
-            return GLib.SOURCE_CONTINUE
-
-        self.library_progress_bar.set_visible(False)
-        self.auth_spinner.set_visible(True)
-        self.auth_spinner.stop()
-        self.auth_progress.set_visible(False)
-        self.pending_library_entries = []
-        if self.startup_session_loading:
-            self.show_main_content()
-        self.startup_session_loading = False
-        self.auth_busy = False
+        for category, items in buckets.items():
+            store = self.category_views[category]
+            store.splice(0, store.get_n_items(), items)
         self.update_library_summary()
         self.update_auth_controls()
         return GLib.SOURCE_REMOVE
@@ -1207,6 +1278,9 @@ class UI:
         self.access_token = None
         self.current_user = ""
         self.anilist_api.access_token = None
+        self._anime_info_cache.clear()
+        self._cover_texture_cache.clear()
+        self._cover_bytes_cache.clear()
         clear_saved_token()
         for model in self.category_views.values():
             model.remove_all()
@@ -1414,7 +1488,7 @@ class UI:
                 retry_video_url,
             ) = self.list_update_queue.get()
             try:
-                api = AniListAPI(token)
+                api = self.anilist_api
                 if field == "progress":
                     api.update_progress(media_id, value)
                 else:
@@ -1601,54 +1675,117 @@ class UI:
     def on_anime_selected(self, item):
         if not item or not hasattr(item, "anime_id"):
             return
-        try:
-            info = self.anilist_api.fetch_anime_info(item.anime_id)
+        anime_id = str(item.anime_id)
+        self._details_request_id += 1
+        request_id = self._details_request_id
 
-            if cover_url := info.get("coverImage", {}).get("large"):
-                try:
-                    response = requests.get(cover_url)
-                    loader = GdkPixbuf.PixbufLoader.new()
-                    loader.write(response.content)
-                    loader.close()
-                    self.right_cover_picture.set_paintable(
-                        Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
-                    )
-                except Exception:
-                    self.right_cover_picture.set_paintable(None)
+        # Show cached data instantly if available
+        cached_info = self._anime_info_cache.get(anime_id)
+        if cached_info:
+            self._apply_anime_details(cached_info, anime_id)
+            return
+
+        # Show loading state and fetch in background
+        self.metadata_label.set_markup(
+            "<span size='large'>Loading...</span>"
+        )
+        self.set_details_text("")
+        self.right_cover_picture.set_paintable(None)
+
+        api = self.anilist_api
+
+        def fetch():
+            try:
+                info = api.fetch_anime_info(anime_id)
+                cover_url = info.get("coverImage", {}).get("large", "")
+                cover_bytes = None
+                if cover_url:
+                    cached_bytes = self._cover_bytes_cache.get(cover_url)
+                    if cached_bytes:
+                        cover_bytes = cached_bytes
+                    else:
+                        try:
+                            cover_bytes = api.download(cover_url)
+                        except Exception:
+                            cover_bytes = None
+                GLib.idle_add(
+                    self._finish_anime_details,
+                    request_id, anime_id, info, cover_url, cover_bytes, None,
+                )
+            except Exception as e:
+                GLib.idle_add(
+                    self._finish_anime_details,
+                    request_id, anime_id, None, None, None, e,
+                )
+
+        Thread(target=fetch, daemon=True).start()
+
+    def _finish_anime_details(
+        self, request_id, anime_id, info, cover_url, cover_bytes, error
+    ):
+        if request_id != self._details_request_id:
+            return GLib.SOURCE_REMOVE
+        if error or not info:
+            self.metadata_label.set_markup(
+                "<span size='large'>Failed to load details</span>"
+            )
+            self.set_details_text(str(error) if error else "")
+            return GLib.SOURCE_REMOVE
+        self._anime_info_cache[anime_id] = info
+        if cover_url and cover_bytes:
+            self._cover_bytes_cache[cover_url] = cover_bytes
+        self._apply_anime_details(info, anime_id)
+        return GLib.SOURCE_REMOVE
+
+    def _apply_anime_details(self, info, anime_id):
+        cover_url = info.get("coverImage", {}).get("large", "")
+        if cover_url:
+            cached_texture = self._cover_texture_cache.get(cover_url)
+            if cached_texture:
+                self.right_cover_picture.set_paintable(cached_texture)
             else:
-                self.right_cover_picture.set_paintable(None)
+                cover_bytes = self._cover_bytes_cache.get(cover_url)
+                if cover_bytes:
+                    try:
+                        loader = GdkPixbuf.PixbufLoader.new()
+                        loader.write(cover_bytes)
+                        loader.close()
+                        texture = Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
+                        self._cover_texture_cache[cover_url] = texture
+                        self.right_cover_picture.set_paintable(texture)
+                    except Exception:
+                        self.right_cover_picture.set_paintable(None)
+                else:
+                    self.right_cover_picture.set_paintable(None)
+        else:
+            self.right_cover_picture.set_paintable(None)
 
-            title_obj = info.get("title", {})
-            title = (
-                title_obj.get("english")
-                or title_obj.get("romaji")
-                or title_obj.get("native")
-                or "Unknown"
-            )
-
-            metadata_markup = (
-                f"<span size='xx-large' weight='bold'>{title}</span>\n\n"
-                f"<span size='large'>"
-                f"Format: {info.get('format', 'N/A')}\n"
-                f"Episodes: {info.get('episodes') or 'N/A'}\n"
-                f"Duration: {info.get('duration') or 'N/A'} min\n"
-                f"Start: {format_date(info.get('startDate'))}\n"
-                f"End: {format_date(info.get('endDate'))}\n"
-                f"Score: {info.get('averageScore') or 'N/A'} / 100\n"
-                f"Popularity: {info.get('popularity') or 'N/A'}"
-                f"</span>"
-            )
-            self.metadata_label.set_markup(metadata_markup)
-
-            desc_html = (
-                interpret_html(info.get("description"))
-                if info.get("description")
-                else "N/A"
-            )
-            self.set_details_text(desc_html)
-
-        except Exception as e:
-            print(f"Failed to load anime info: {e}")
+        title_obj = info.get("title", {})
+        title = (
+            title_obj.get("english")
+            or title_obj.get("romaji")
+            or title_obj.get("native")
+            or "Unknown"
+        )
+        metadata_markup = (
+            f"<span size='xx-large' weight='bold'>{GLib.markup_escape_text(title)}</span>\n\n"
+            f"<span size='large'>"
+            f"Format: {info.get('format', 'N/A')}\n"
+            f"Episodes: {info.get('episodes') or 'N/A'}\n"
+            f"Duration: {info.get('duration') or 'N/A'} min\n"
+            f"Start: {format_date(info.get('startDate'))}\n"
+            f"End: {format_date(info.get('endDate'))}\n"
+            f"Score: {info.get('averageScore') or 'N/A'} / 100\n"
+            f"Popularity: {info.get('popularity') or 'N/A'}"
+            f"</span>"
+        )
+        self.metadata_label.set_markup(metadata_markup)
+        desc_html = (
+            interpret_html(info.get("description"))
+            if info.get("description")
+            else "N/A"
+        )
+        self.set_details_text(desc_html)
 
     def show_error(self, title, message):
         try:
@@ -1912,14 +2049,41 @@ def banner_texture_from_image_data(image_data, width, height):
     return Gdk.Texture.new_for_pixbuf(cropped)
 
 
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+_SESSION_CONFIG_PATH = _CONFIG_HOME / "ani-gtk" / "session.ini"
+_PREFERENCES_CONFIG_PATH = _CONFIG_HOME / "ani-gtk" / "settings.ini"
+
+
 def session_config_path():
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return config_home / "ani-gtk" / "session.ini"
+    return _SESSION_CONFIG_PATH
 
 
 def preferences_config_path():
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return config_home / "ani-gtk" / "settings.ini"
+    return _PREFERENCES_CONFIG_PATH
+
+
+# Cache for anime folder lookups to avoid re-parsing config per anime during batch load
+_folder_cache = {}
+_folder_cache_mtime = 0
+
+
+def _read_anime_folder_cached(anime_id):
+    global _folder_cache, _folder_cache_mtime
+    path = _PREFERENCES_CONFIG_PATH
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return ""
+    if mtime != _folder_cache_mtime:
+        _folder_cache_mtime = mtime
+        config = configparser.ConfigParser()
+        try:
+            config.read(path)
+        except (OSError, configparser.Error):
+            _folder_cache = {}
+            return ""
+        _folder_cache = dict(config.items("PREFERENCES")) if config.has_section("PREFERENCES") else {}
+    return _folder_cache.get(f"anime_folder_{anime_id}", "")
 
 
 def read_video_detection_setting():
