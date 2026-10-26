@@ -334,7 +334,6 @@ class UI:
 
             progress_sorter = Gtk.CustomSorter.new(compare_progress, None)
 
-            # ADD THIS: Sorter for the folder column (sorts items with a folder path first/last)
             def compare_folder(item1, item2, *args):
                 has_folder_1 = bool(item1.folder_path)
                 has_folder_2 = bool(item2.folder_path)
@@ -1025,13 +1024,14 @@ class UI:
 
     def _populate_library(self, library_entries):
         """Bulk-insert all library entries using splice for minimal UI churn."""
+        _preload_folder_cache()
         buckets = {cat: [] for cat in self.category_views}
         for category, item_data in library_entries:
             if category in buckets:
                 buckets[category].append(
                     AnimeItem(
                         **item_data,
-                        folder_path=_read_anime_folder_cached(item_data["anime_id"]),
+                        folder_path=_get_cached_anime_folder(item_data["anime_id"]),
                     )
                 )
         for category, items in buckets.items():
@@ -1121,13 +1121,14 @@ class UI:
         self._anime_info_cache.clear()
         self._cover_texture_cache.clear()
         self._cover_bytes_cache.clear()
+        _preload_folder_cache()
         buckets = {cat: [] for cat in self.category_views}
         for category, item_data in library_entries:
             if category in buckets:
                 buckets[category].append(
                     AnimeItem(
                         **item_data,
-                        folder_path=_read_anime_folder_cached(item_data["anime_id"]),
+                        folder_path=_get_cached_anime_folder(item_data["anime_id"]),
                     )
                 )
         for category, items in buckets.items():
@@ -1155,7 +1156,6 @@ class UI:
         }
         matches = []
         
-        # Check both "CURRENTLY WATCHING" and "REWATCHING" categories
         stores_to_check = [
             self.category_views.get("CURRENTLY WATCHING"),
             self.category_views.get("REWATCHING"),
@@ -1713,13 +1713,11 @@ class UI:
         self._details_request_id += 1
         request_id = self._details_request_id
 
-        # Show cached data instantly if available
         cached_info = self._anime_info_cache.get(anime_id)
         if cached_info:
             self._apply_anime_details(cached_info, anime_id)
             return
 
-        # Show loading state and fetch in background
         self.metadata_label.set_markup(
             "<span size='large'>Loading...</span>"
         )
@@ -2101,13 +2099,15 @@ _folder_cache = {}
 _folder_cache_mtime = 0
 
 
-def _read_anime_folder_cached(anime_id):
+def _preload_folder_cache():
     global _folder_cache, _folder_cache_mtime
     path = _PREFERENCES_CONFIG_PATH
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return ""
+        _folder_cache = {}
+        _folder_cache_mtime = 0
+        return
     if mtime != _folder_cache_mtime:
         _folder_cache_mtime = mtime
         config = configparser.ConfigParser()
@@ -2115,9 +2115,17 @@ def _read_anime_folder_cached(anime_id):
             config.read(path)
         except (OSError, configparser.Error):
             _folder_cache = {}
-            return ""
+            return
         _folder_cache = dict(config.items("PREFERENCES")) if config.has_section("PREFERENCES") else {}
+
+
+def _get_cached_anime_folder(anime_id):
     return _folder_cache.get(f"anime_folder_{anime_id}", "")
+
+
+def _read_anime_folder_cached(anime_id):
+    _preload_folder_cache()
+    return _get_cached_anime_folder(anime_id)
 
 
 def read_video_detection_setting():
