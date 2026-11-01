@@ -1,5 +1,15 @@
 # anilist.py
+import threading
+import time
+
 import requests
+
+
+_REQUEST_LOCK = threading.Lock()
+_MIN_REQUEST_INTERVAL = 1.0
+_last_request_at = 0.0
+_rate_limited_until = 0.0
+
 
 class AniListAPI:
     def __init__(self, access_token=None):
@@ -12,12 +22,37 @@ class AniListAPI:
             self._session.headers["Authorization"] = f"Bearer {access_token}"
 
     def _post(self, query, variables):
-        response = self._session.post(
-            self.base_url,
-            json={"query": query, "variables": variables},
-            timeout=30,
-        )
-        response.raise_for_status()
+        global _last_request_at, _rate_limited_until
+        with _REQUEST_LOCK:
+            for attempt in range(2):
+                now = time.monotonic()
+                delay = max(
+                    _last_request_at + _MIN_REQUEST_INTERVAL - now,
+                    _rate_limited_until - now,
+                    0,
+                )
+                if delay:
+                    time.sleep(delay)
+                _last_request_at = time.monotonic()
+                response = self._session.post(
+                    self.base_url,
+                    json={"query": query, "variables": variables},
+                    timeout=30,
+                )
+                if response.status_code != 429:
+                    response.raise_for_status()
+                    break
+
+                retry_after = response.headers.get("Retry-After", "60")
+                try:
+                    retry_delay = max(1.0, float(retry_after))
+                except (TypeError, ValueError):
+                    retry_delay = 60.0
+                _rate_limited_until = time.monotonic() + retry_delay
+                if attempt == 1:
+                    response.raise_for_status()
+                time.sleep(retry_delay)
+
         payload = response.json()
         if payload.get("errors"):
             raise RuntimeError(payload["errors"][0].get("message", "AniList API error"))

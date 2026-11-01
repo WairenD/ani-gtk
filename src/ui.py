@@ -1,15 +1,7 @@
-import configparser
 import gi
-import json
-import os
 import queue
-import re
-import threading
-import unicodedata
 from collections import OrderedDict
-from functools import lru_cache
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
 from threading import Thread
 from urllib.parse import unquote, urlencode, urlparse
@@ -18,32 +10,40 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from anilist import AniListAPI
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk
+from media import (
+    CATEGORY_TO_STATUS,
+    STATUS_OPTIONS,
+    STATUS_TO_CATEGORY,
+    prepare_media_entries,
+)
 from mpris import VIDEO_EXTENSIONS, extract_episode_info, extract_episode_number
+from oauth import OAuthCallbackServer, read_client_id
 import pyperclip
+from preferences import (
+    _get_cached_anime_folder,
+    _preload_folder_cache,
+    clear_saved_token,
+    read_anime_folder,
+    read_completion_threshold,
+    read_confirm_episode_updates,
+    read_saved_token,
+    read_video_detection_setting,
+    save_anime_folder,
+    save_anime_video_title,
+    save_completion_threshold,
+    save_confirm_episode_updates,
+    save_token,
+    save_video_detection_setting,
+)
+from titles import clean_video_title, normalize_title
 from utils import format_date, interpret_html
 
 
-STATUS_OPTIONS = (
-    ("CURRENT", "Watching"),
-    ("REPEATING", "Rewatching"),
-    ("COMPLETED", "Completed"),
-    ("DROPPED", "Dropped"),
-    ("PLANNING", "Plan to Watch"),
-    ("PAUSED", "Paused"),
-)
-STATUS_TO_CATEGORY = {
-    "CURRENT": "CURRENTLY WATCHING",
-    "REPEATING": "REWATCHING",
-    "COMPLETED": "COMPLETED",
-    "DROPPED": "DROPPED",
-    "PLANNING": "PLAN TO WATCH",
-    "PAUSED": "PAUSED",
-}
-CATEGORY_TO_STATUS = {category: status for status, category in STATUS_TO_CATEGORY.items()}
 ANIME_INFO_CACHE_LIMIT = 24
 COVER_TEXTURE_CACHE_LIMIT = 12
 COVER_BYTES_CACHE_LIMIT = 4
-LIBRARY_INSERT_BATCH_SIZE = 20
+LIBRARY_INSERT_BATCH_SIZE = 8
+LIBRARY_BATCH_INTERVAL_MS = 16
 
 
 class AnimeItem(GObject.GObject):
@@ -78,6 +78,7 @@ class UI:
         self._cover_texture_cache = OrderedDict()
         self._cover_bytes_cache = OrderedDict()
         self._details_request_id = 0
+        self._detail_load_source_id = 0
         self._library_insert_generation = 0
         self.list_update_queue = queue.Queue()
         Thread(target=self.process_list_update_queue, daemon=True).start()
@@ -133,6 +134,12 @@ class UI:
         )
 
     def create_ui_components(self):
+        self.score_options_model = Gtk.StringList.new(
+            [str(score) for score in range(101)]
+        )
+        self.status_options_model = Gtk.StringList.new(
+            [label for _, label in STATUS_OPTIONS]
+        )
         self.main_container = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=16,
@@ -311,6 +318,7 @@ class UI:
         self.create_details_panel()
 
         self.category_views = {}
+        self.category_sort_models = {}
         categories = [
             "CURRENTLY WATCHING",
             "REWATCHING",
@@ -494,9 +502,8 @@ class UI:
                 elif prop == "score":
 
                     def setup_score(factory, item):
-                        score_model = Gtk.StringList.new([str(i) for i in range(101)])
                         dropdown = Gtk.DropDown(
-                            model=score_model,
+                            model=ui_instance.score_options_model,
                             valign=Gtk.Align.CENTER,
                             hexpand=True,
                         )
@@ -526,9 +533,7 @@ class UI:
 
                     def setup_status(factory, item):
                         dropdown = Gtk.DropDown(
-                            model=Gtk.StringList.new(
-                                [label for _, label in STATUS_OPTIONS]
-                            ),
+                            model=ui_instance.status_options_model,
                             valign=Gtk.Align.CENTER,
                             hexpand=True,
                         )
@@ -603,6 +608,7 @@ class UI:
             scroll.set_child(col_view)
             self.tab_control.append_page(scroll, Gtk.Label(label=cat))
             self.category_views[cat] = store
+            self.category_sort_models[cat] = (sort_model, col_view)
         self.update_library_summary()
 
         self.root_stack = Gtk.Stack(
@@ -1096,25 +1102,42 @@ class UI:
         self._library_insert_entries = library_entries
         self._library_insert_index = 0
         self._library_clear_existing = True
-        self._insert_library_batch(generation)
+        for sort_model, _view in self.category_sort_models.values():
+            sort_model.set_sorter(None)
+        GLib.timeout_add(
+            LIBRARY_BATCH_INTERVAL_MS,
+            self._insert_library_batch,
+            generation,
+        )
 
     def _insert_library_batch(self, generation):
         if generation != self._library_insert_generation:
             return GLib.SOURCE_REMOVE
         if self._library_clear_existing:
-            has_more_to_clear = False
+            remaining = LIBRARY_INSERT_BATCH_SIZE
             for store in self.category_views.values():
-                remove_count = min(
-                    LIBRARY_INSERT_BATCH_SIZE, store.get_n_items()
-                )
+                remove_count = min(remaining, store.get_n_items())
                 if remove_count:
                     store.splice(0, remove_count, [])
-                has_more_to_clear |= store.get_n_items() > 0
+                    remaining -= remove_count
+                if remaining == 0:
+                    break
+            has_more_to_clear = any(
+                store.get_n_items() for store in self.category_views.values()
+            )
             if has_more_to_clear:
-                GLib.timeout_add(1, self._insert_library_batch, generation)
+                GLib.timeout_add(
+                    LIBRARY_BATCH_INTERVAL_MS,
+                    self._insert_library_batch,
+                    generation,
+                )
                 return GLib.SOURCE_REMOVE
             self._library_clear_existing = False
-            GLib.timeout_add(1, self._insert_library_batch, generation)
+            GLib.timeout_add(
+                LIBRARY_BATCH_INTERVAL_MS,
+                self._insert_library_batch,
+                generation,
+            )
             return GLib.SOURCE_REMOVE
 
         entries = self._library_insert_entries
@@ -1136,10 +1159,16 @@ class UI:
                 )
         self._library_insert_index = end
         if end < len(entries):
-            GLib.timeout_add(1, self._insert_library_batch, generation)
+            GLib.timeout_add(
+                LIBRARY_BATCH_INTERVAL_MS,
+                self._insert_library_batch,
+                generation,
+            )
             return GLib.SOURCE_REMOVE
 
         self._library_insert_entries = None
+        for sort_model, view in self.category_sort_models.values():
+            sort_model.set_sorter(view.get_sorter())
         if getattr(self, "library_population_refresh", False):
             self.library_population_refresh = False
             self.refresh_busy = False
@@ -1499,6 +1528,8 @@ class UI:
         self._library_insert_generation += 1
         self._library_insert_entries = None
         self.library_population_refresh = False
+        for sort_model, view in self.category_sort_models.values():
+            sort_model.set_sorter(view.get_sorter())
         self.refresh_busy = False
         self.refresh_spinner.stop()
         self.refresh_spinner.set_visible(False)
@@ -1991,11 +2022,14 @@ class UI:
         )
 
     def on_anime_selected(self, item):
+        if self._detail_load_source_id:
+            GLib.source_remove(self._detail_load_source_id)
+            self._detail_load_source_id = 0
+        self._details_request_id += 1
+        request_id = self._details_request_id
         if not item or not hasattr(item, "anime_id"):
             return
         anime_id = str(item.anime_id)
-        self._details_request_id += 1
-        request_id = self._details_request_id
 
         cached_info = self._cache_get(self._anime_info_cache, anime_id)
         if cached_info:
@@ -2026,7 +2060,16 @@ class UI:
         self.set_details_text("")
         self.right_cover_picture.set_paintable(None)
 
-        api = self.anilist_api
+        self._detail_load_source_id = GLib.timeout_add(
+            250,
+            self._start_anime_details_fetch,
+            request_id,
+            anime_id,
+            self.anilist_api,
+        )
+
+    def _start_anime_details_fetch(self, request_id, anime_id, api):
+        self._detail_load_source_id = 0
 
         def fetch():
             if request_id != self._details_request_id:
@@ -2046,15 +2089,27 @@ class UI:
                     return
                 GLib.idle_add(
                     self._finish_anime_details,
-                    request_id, anime_id, info, cover_url, cover_bytes, None,
+                    request_id,
+                    anime_id,
+                    info,
+                    cover_url,
+                    cover_bytes,
+                    None,
                 )
-            except Exception as e:
+            except Exception as error:
                 GLib.idle_add(
                     self._finish_anime_details,
-                    request_id, anime_id, None, None, None, e,
+                    request_id,
+                    anime_id,
+                    None,
+                    None,
+                    None,
+                    error,
                 )
 
-        Thread(target=fetch, daemon=True).start()
+        if request_id == self._details_request_id:
+            Thread(target=fetch, daemon=True).start()
+        return GLib.SOURCE_REMOVE
 
     def _fetch_cached_cover(self, request_id, anime_id, info, cover_url, api):
         if request_id != self._details_request_id:
@@ -2197,212 +2252,6 @@ class UI:
             dialog.present()
 
 
-class OAuthCallbackServer:
-    def __init__(
-        self, on_token, redirect_uri, state, host="127.0.0.1", port=8765
-    ):
-        self.on_token = on_token
-        self.redirect_uri = redirect_uri
-        self.state = state
-        callback = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def send_text(self, status, body, content_type="text/plain; charset=utf-8"):
-                encoded = body.encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(encoded)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(encoded)
-
-            def do_GET(self):
-                if self.path.split("?", 1)[0] != "/callback":
-                    return self.send_text(404, "Not found")
-                page = """<!doctype html><html><head><meta charset="utf-8">
-<title>AniList sign-in</title></head><body>
-<p id="status">Completing AniList sign-in...</p>
-<script>
-const expectedState = __EXPECTED_STATE__;
-const token = new URLSearchParams(location.hash.slice(1)).get('access_token');
-const state = new URLSearchParams(location.hash.slice(1)).get('state');
-history.replaceState(null, '', location.pathname);
-if (!token || state !== expectedState) {
-  document.getElementById('status').textContent =
-        'AniList authorization could not be verified. Please retry.';
-} else {
-  fetch('/token', {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({access_token: token, state: state})})
-    .then(response => {
-      document.getElementById('status').textContent = response.ok
-        ? 'AniList connected. You can close this tab.'
-        : 'Could not pass the token to the app. Please retry.';
-    })
-    .catch(() => document.getElementById('status').textContent =
-      'Could not reach the app. Please retry.');
-}
-</script></body></html>"""
-                page = page.replace("__EXPECTED_STATE__", json.dumps(callback.state))
-                self.send_text(200, page, "text/html; charset=utf-8")
-
-            def do_POST(self):
-                if self.path != "/token":
-                    return self.send_text(404, "Not found")
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                    if length <= 0 or length > 8192:
-                        raise ValueError("Invalid request size")
-                    payload = json.loads(self.rfile.read(length))
-                    token = payload.get("access_token", "")
-                    state = payload.get("state", "")
-                    if (
-                        not isinstance(token, str)
-                        or not token
-                        or state != callback.state
-                    ):
-                        raise ValueError("Missing access token")
-                except (ValueError, json.JSONDecodeError):
-                    return self.send_text(400, "Invalid token payload")
-                self.send_text(200, "Token received")
-                GLib.idle_add(callback.on_token, token)
-
-            def log_message(self, *_args):
-                pass
-
-        self.server = ThreadingHTTPServer((host, port), Handler)
-        self.thread = Thread(target=self.server.serve_forever, daemon=True)
-
-    def start(self):
-        self.thread.start()
-
-    def stop(self):
-        self.server.shutdown()
-        self.server.server_close()
-
-
-def read_client_id():
-    if client_id := os.environ.get("ANILIST_CLIENT_ID", "").strip():
-        return client_id
-    config_paths = (
-        Path("/etc/ani-gtk/config.ini"),
-        Path(__file__).resolve().parent.parent / "config.ini",
-    )
-    for config_path in config_paths:
-        config = configparser.ConfigParser()
-        try:
-            config.read(config_path)
-            client_id = config.get("ANILIST", "client_id", fallback="").strip()
-            if client_id:
-                return client_id
-        except (OSError, configparser.Error):
-            continue
-    return ""
-
-
-def prepare_media_entries(media_lists):
-    _preload_folder_cache()
-    mapping = {
-        "Dropped": "DROPPED",
-        "Completed": "COMPLETED",
-        "Planning": "PLAN TO WATCH",
-        "Plan to Watch": "PLAN TO WATCH",
-        "Paused": "PAUSED",
-        "Rewatching": "REWATCHING",
-        "Watching": "CURRENTLY WATCHING",
-        "Current": "CURRENTLY WATCHING",
-    }
-    prepared = []
-    for media_list in media_lists:
-        category = mapping.get(media_list.get("name", ""))
-        if not category:
-            continue
-        for entry in media_list.get("entries", []):
-            media = entry.get("media", {})
-            title_data = media.get("title", {})
-            title = (
-                title_data.get("english")
-                or title_data.get("romaji")
-                or title_data.get("native")
-                or "Unknown"
-            )
-            aliases = list(
-                dict.fromkeys(
-                    value
-                    for value in (
-                        title_data.get("english"),
-                        title_data.get("romaji"),
-                        title_data.get("native"),
-                        *media.get("synonyms", []),
-                        *_get_cached_anime_video_titles(str(media.get("id"))),
-                    )
-                    if value
-                )
-            )
-            episodes = media.get("episodes") or 0
-            progress = entry.get("progress", 0) or 0
-            fraction = (
-                min(max(progress / episodes, 0.0), 1.0)
-                if episodes > 0
-                else 1.0
-            )
-            prepared.append(
-                (
-                    category,
-                    {
-                        "title": title,
-                        "title_aliases": "\n".join(aliases),
-                        "progress": (
-                            f"{progress}/{episodes}" if episodes > 0 else f"{progress}/?"
-                        ),
-                        "progress_fraction": fraction,
-                        "score": int(entry.get("score", 0) or 0),
-                        "status": entry.get("status") or CATEGORY_TO_STATUS[category],
-                        "format_type": str(media.get("format", "N/A")),
-                        "anime_id": str(media.get("id")),
-                        "episodes_total": episodes,
-                        "watched_episodes": progress,
-                    },
-                )
-            )
-    return prepared
-
-
-def normalize_title(value):
-    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore")
-    return " ".join(re.findall(r"[a-z0-9]+", normalized.decode("ascii").lower()))
-
-
-def clean_video_title(value):
-    if "://" in value:
-        name = Path(unquote(urlparse(value).path)).stem
-    else:
-        file_path = Path(value)
-        name = (
-            file_path.stem
-            if file_path.suffix.lower() in VIDEO_EXTENSIONS
-            else value
-        )
-    episode_info = extract_episode_info(name)
-    season = episode_info[0] if episode_info else None
-    season_label = f" season {season} " if season else " "
-    name = re.sub(r"(?i)[ ._-]*s\s*\d{1,2}[ ._-]*e\s*\d{1,3}\b", " ", name)
-    name = re.sub(r"(?i)[ ._-]*\d{1,2}\s*x\s*\d{1,3}\b", " ", name)
-    name = re.sub(
-        r"(?i)[ ._-]*season[ ._-]*\d{1,2}\s*(?:(?:episode|ep)[ ._-]*)?\d{1,3}\b",
-        " ",
-        name,
-    )
-    name = re.sub(r"(?i)[ ._-]*(?:episode|ep)[ ._-]*\d{1,3}\b", " ", name)
-    name = re.sub(r"(?i)[ ._-]+e[ ._-]*\d{1,3}\b", " ", name)
-    name = re.sub(r"(?i)[ ._-]+\d{1,3}(?=[ ._-]|$)", " ", name)
-    name = re.sub(
-        r"(?i)[ ._-]+(?:\d{3,4}p|web[ ._-]?dl|bluray|h\.?26[45]|x26[45]).*$",
-        " ",
-        name,
-    )
-    return (name.replace(".", " ").replace("_", " ") + season_label).strip()
-
-
 def texture_from_image_data(image_data, max_width, max_height):
     loader = GdkPixbuf.PixbufLoader.new()
     loader.write(image_data)
@@ -2435,165 +2284,3 @@ def banner_texture_from_image_data(image_data, width, height):
     crop_y = (scaled_height - height) // 2
     cropped = scaled.new_subpixbuf(crop_x, crop_y, width, height)
     return Gdk.Texture.new_for_pixbuf(cropped)
-
-
-_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-_SESSION_CONFIG_PATH = _CONFIG_HOME / "ani-gtk" / "session.ini"
-_PREFERENCES_CONFIG_PATH = _CONFIG_HOME / "ani-gtk" / "settings.ini"
-
-
-def session_config_path():
-    return _SESSION_CONFIG_PATH
-
-
-def preferences_config_path():
-    return _PREFERENCES_CONFIG_PATH
-
-
-# Cache for anime folder lookups to avoid re-parsing config per anime during batch load
-_folder_cache = {}
-_folder_cache_mtime = 0
-
-
-def _preload_folder_cache():
-    global _folder_cache, _folder_cache_mtime
-    path = _PREFERENCES_CONFIG_PATH
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        _folder_cache = {}
-        _folder_cache_mtime = 0
-        return
-    if mtime != _folder_cache_mtime:
-        _folder_cache_mtime = mtime
-        config = configparser.ConfigParser()
-        try:
-            config.read(path)
-        except (OSError, configparser.Error):
-            _folder_cache = {}
-            return
-        _folder_cache = dict(config.items("PREFERENCES")) if config.has_section("PREFERENCES") else {}
-
-
-def _get_cached_anime_folder(anime_id):
-    return _folder_cache.get(f"anime_folder_{anime_id}", "")
-
-
-def _get_cached_anime_video_titles(anime_id):
-    raw_titles = _folder_cache.get(f"anime_video_titles_{anime_id}", "[]")
-    try:
-        titles = json.loads(raw_titles)
-    except (TypeError, json.JSONDecodeError):
-        return []
-    if not isinstance(titles, list):
-        return []
-    return [title for title in titles if isinstance(title, str) and title]
-
-
-def _read_anime_folder_cached(anime_id):
-    _preload_folder_cache()
-    return _get_cached_anime_folder(anime_id)
-
-
-def read_video_detection_setting():
-    return read_preference("video_detection_enabled", True, "getboolean")
-
-
-def read_completion_threshold():
-    try:
-        return max(1, min(read_preference("completion_threshold", 70, "getint"), 100))
-    except (TypeError, ValueError):
-        return 70
-
-
-def read_confirm_episode_updates():
-    return read_preference("confirm_episode_updates", False, "getboolean")
-
-
-def anime_folder_preference_key(anime_id):
-    return f"anime_folder_{anime_id}"
-
-
-def read_anime_folder(anime_id):
-    return read_preference(anime_folder_preference_key(anime_id), "", "get")
-
-
-def save_anime_folder(anime_id, folder):
-    key = anime_folder_preference_key(anime_id)
-    save_preference(key, folder)
-    _folder_cache[key] = str(folder)
-
-
-def save_anime_video_title(anime_id, video_title):
-    alias = clean_video_title(video_title)
-    if not normalize_title(alias):
-        return ""
-    key = f"anime_video_titles_{anime_id}"
-    titles = _get_cached_anime_video_titles(anime_id)
-    normalized_titles = {normalize_title(title) for title in titles}
-    if normalize_title(alias) not in normalized_titles:
-        titles.append(alias)
-        serialized = json.dumps(titles, ensure_ascii=True)
-        save_preference(key, serialized)
-        _folder_cache[key] = serialized
-    return alias
-
-
-def read_preference(key, fallback, getter):
-    config = configparser.ConfigParser()
-    try:
-        config.read(preferences_config_path())
-        return getattr(config, getter)("PREFERENCES", key, fallback=fallback)
-    except (OSError, configparser.Error):
-        return fallback
-
-
-def save_preference(key, value):
-    path = preferences_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    config = configparser.ConfigParser()
-    config.read(path)
-    if "PREFERENCES" not in config:
-        config["PREFERENCES"] = {}
-    config["PREFERENCES"][key] = str(value)
-    with path.open("w") as settings_file:
-        config.write(settings_file)
-    path.chmod(0o600)
-
-
-def save_video_detection_setting(enabled):
-    save_preference("video_detection_enabled", bool(enabled))
-
-
-def save_completion_threshold(threshold):
-    save_preference("completion_threshold", max(1, min(int(threshold), 100)))
-
-
-def save_confirm_episode_updates(enabled):
-    save_preference("confirm_episode_updates", bool(enabled))
-
-
-def read_saved_token():
-    config = configparser.ConfigParser()
-    try:
-        config.read(session_config_path())
-        return config.get("AUTH", "access_token", fallback="")
-    except (OSError, configparser.Error):
-        return ""
-
-
-def save_token(token):
-    path = session_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    config = configparser.ConfigParser()
-    config["AUTH"] = {"access_token": token}
-    with path.open("w") as session_file:
-        config.write(session_file)
-    path.chmod(0o600)
-
-
-def clear_saved_token():
-    try:
-        session_config_path().unlink(missing_ok=True)
-    except OSError:
-        pass
