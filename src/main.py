@@ -23,6 +23,7 @@ def on_activate(app):
       app,
       window.ui.on_local_video_complete,
       window.ui.completion_threshold,
+      window.ui.on_local_video_started,
     )
     window.ui.video_watcher = app.video_watcher
     app.video_watcher.set_enabled(window.ui.video_detection_enabled)

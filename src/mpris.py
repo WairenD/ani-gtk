@@ -34,9 +34,16 @@ def is_local_video_url(url):
 
 
 class LocalVideoWatcher:
-    def __init__(self, application, on_video_complete=None, completion_threshold=70):
+    def __init__(
+        self,
+        application,
+        on_video_complete=None,
+        completion_threshold=70,
+        on_video_started=None,
+    ):
         self.application = application
         self.on_video_complete = on_video_complete
+        self.on_video_started = on_video_started
         self.enabled = True
         self.completion_threshold = max(1, min(int(completion_threshold), 100))
         self.connection = None
@@ -149,9 +156,11 @@ class LocalVideoWatcher:
                 "status": properties.get("PlaybackStatus", "Stopped"),
                 "metadata": properties.get("Metadata", {}),
                 "notified": False,
+                "start_notified": False,
                 "position_pending": False,
                 "completed_url": "",
             }
+            self.notify_video_started(name, self.players[name])
         except GLib.Error:
             return
 
@@ -184,13 +193,22 @@ class LocalVideoWatcher:
             player["status"] = changed["PlaybackStatus"]
             if player["status"] != "Playing":
                 player["notified"] = False
+                if player["status"] == "Stopped":
+                    player["start_notified"] = False
         if "Metadata" in changed:
+            previous_url = unpack_value(
+                player["metadata"].get("xesam:url", "")
+            )
             player["metadata"] = changed["Metadata"]
             current_url = unpack_value(player["metadata"].get("xesam:url", ""))
-            if current_url != player["completed_url"]:
+            if current_url != previous_url:
                 player["notified"] = False
+                player["start_notified"] = False
 
-        if not self.enabled or player["status"] != "Playing" or player["notified"]:
+        self.notify_video_started(player_name, player)
+
+    def notify_video_started(self, player_name, player):
+        if not self.enabled or player["status"] != "Playing":
             return
         metadata = player["metadata"]
         url = unpack_value(metadata.get("xesam:url", ""))
@@ -200,13 +218,18 @@ class LocalVideoWatcher:
         title = unpack_value(metadata.get("xesam:title", "")) or Path(
             unquote(urlparse(url).path)
         ).name
-        notification = Gio.Notification.new("Local video started")
-        notification.set_body(str(title))
-        notification.set_icon(Gio.ThemedIcon.new("video-x-generic"))
-        self.application.send_notification(
-            f"local-video-{player_name}", notification
-        )
-        player["notified"] = True
+        if not player["start_notified"]:
+            player["start_notified"] = True
+            if self.on_video_started:
+                self.on_video_started(str(title), url)
+        if not player["notified"]:
+            notification = Gio.Notification.new("Local video started")
+            notification.set_body(str(title))
+            notification.set_icon(Gio.ThemedIcon.new("video-x-generic"))
+            self.application.send_notification(
+                f"local-video-{player_name}", notification
+            )
+            player["notified"] = True
 
     def poll_positions(self):
         if not self.connection:

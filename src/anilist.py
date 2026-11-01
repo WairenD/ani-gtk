@@ -6,6 +6,7 @@ class AniListAPI:
         self.base_url = "https://graphql.anilist.co"
         self.access_token = access_token
         self._session = requests.Session()
+        self._download_session = requests.Session()
         self._session.headers["Content-Type"] = "application/json"
         if access_token:
             self._session.headers["Authorization"] = f"Bearer {access_token}"
@@ -23,8 +24,8 @@ class AniListAPI:
         return payload["data"]
 
     def download(self, url, timeout=15):
-        """Download arbitrary URL reusing the pooled session."""
-        response = self._session.get(url, timeout=timeout)
+        """Download a public resource without sending AniList credentials."""
+        response = self._download_session.get(url, timeout=timeout)
         response.raise_for_status()
         return response.content
 
@@ -80,6 +81,7 @@ class AniListAPI:
                             format
                             episodes
                         }
+                        status
                         progress
                         score
                     }
@@ -114,6 +116,18 @@ class AniListAPI:
         }
         """
         variables = {"mediaId": int(media_id), "score": float(score)}
+        return self._post(query, variables)["SaveMediaListEntry"]
+
+    def update_status(self, media_id, status):
+        query = """
+        mutation ($mediaId: Int!, $status: MediaListStatus!) {
+            SaveMediaListEntry(mediaId: $mediaId, status: $status) {
+                id
+                status
+            }
+        }
+        """
+        variables = {"mediaId": int(media_id), "status": status}
         return self._post(query, variables)["SaveMediaListEntry"]
 
     def fetch_anime_info(self, anime_id):

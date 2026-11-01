@@ -1,0 +1,3 @@
+from qwen3.5:9b
+parameter num_ctx 32768
+parameter temperature 0.2

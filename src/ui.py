@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import unicodedata
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,12 +23,36 @@ import pyperclip
 from utils import format_date, interpret_html
 
 
+STATUS_OPTIONS = (
+    ("CURRENT", "Watching"),
+    ("REPEATING", "Rewatching"),
+    ("COMPLETED", "Completed"),
+    ("DROPPED", "Dropped"),
+    ("PLANNING", "Plan to Watch"),
+    ("PAUSED", "Paused"),
+)
+STATUS_TO_CATEGORY = {
+    "CURRENT": "CURRENTLY WATCHING",
+    "REPEATING": "REWATCHING",
+    "COMPLETED": "COMPLETED",
+    "DROPPED": "DROPPED",
+    "PLANNING": "PLAN TO WATCH",
+    "PAUSED": "PAUSED",
+}
+CATEGORY_TO_STATUS = {category: status for status, category in STATUS_TO_CATEGORY.items()}
+ANIME_INFO_CACHE_LIMIT = 24
+COVER_TEXTURE_CACHE_LIMIT = 12
+COVER_BYTES_CACHE_LIMIT = 4
+LIBRARY_INSERT_BATCH_SIZE = 20
+
+
 class AnimeItem(GObject.GObject):
     title = GObject.Property(type=str, default="")
     title_aliases = GObject.Property(type=str, default="")
     progress = GObject.Property(type=str, default="")
     progress_fraction = GObject.Property(type=float, default=0.0)
     score = GObject.Property(type=int, default=0)
+    status = GObject.Property(type=str, default="PLANNING")
     format_type = GObject.Property(type=str, default="")
     anime_id = GObject.Property(type=str, default="")
     folder_path = GObject.Property(type=str, default="")
@@ -49,10 +74,11 @@ class UI:
         self.pending_episode_updates = {}
         self.current_user = ""
         self.anilist_api = AniListAPI(self.access_token)
-        self._anime_info_cache = {}
-        self._cover_texture_cache = {}
-        self._cover_bytes_cache = {}
+        self._anime_info_cache = OrderedDict()
+        self._cover_texture_cache = OrderedDict()
+        self._cover_bytes_cache = OrderedDict()
         self._details_request_id = 0
+        self._library_insert_generation = 0
         self.list_update_queue = queue.Queue()
         Thread(target=self.process_list_update_queue, daemon=True).start()
         self.root.set_title("AniList Library Explorer")
@@ -345,6 +371,7 @@ class UI:
                 ("", "folder", 36, False, folder_sorter),
                 ("Title", "title", 240, True, title_sorter),
                 ("Progress", "progress_fraction", 170, False, progress_sorter),
+                ("Status", "status", 130, False, None),
                 ("Score", "score", 90, False, score_sorter),
                 ("Type", "format_type", 120, False, type_sorter),
             ]
@@ -495,6 +522,46 @@ class UI:
 
                     factory.connect("setup", setup_score)
                     factory.connect("bind", bind_score)
+                elif prop == "status":
+
+                    def setup_status(factory, item):
+                        dropdown = Gtk.DropDown(
+                            model=Gtk.StringList.new(
+                                [label for _, label in STATUS_OPTIONS]
+                            ),
+                            valign=Gtk.Align.CENTER,
+                            hexpand=True,
+                        )
+                        dropdown.connect(
+                            "notify::selected",
+                            lambda dropdown_obj, _: ui_instance.on_status_changed(
+                                dropdown_obj
+                            ),
+                        )
+                        item.set_child(dropdown)
+
+                    def bind_status(factory, item):
+                        dropdown = item.get_child()
+                        anime = item.get_item()
+                        dropdown.anime = anime
+                        if anime:
+                            dropdown.is_binding = True
+                            dropdown.set_selected(
+                                next(
+                                    (
+                                        index
+                                        for index, (status, _) in enumerate(
+                                            STATUS_OPTIONS
+                                        )
+                                        if status == anime.status
+                                    ),
+                                    0,
+                                )
+                            )
+                            dropdown.is_binding = False
+
+                    factory.connect("setup", setup_status)
+                    factory.connect("bind", bind_status)
                 else:
                     def setup_label(factory, item, item_prop=prop):
                         label = Gtk.Label(xalign=0, margin_start=10)
@@ -997,6 +1064,7 @@ class UI:
                 self.show_error("Login Error", f"AniList authentication failed: {error}")
             return GLib.SOURCE_REMOVE
 
+        self._details_request_id += 1
         self.anilist_api = api
         self.access_token = token
         self.current_user = viewer["name"]
@@ -1017,16 +1085,43 @@ class UI:
             self.library_progress_bar.set_fraction(0.0)
             self.library_progress_bar.set_text("0%")
             self.library_progress_bar.set_visible(True)
-        for model in self.category_views.values():
-            model.remove_all()
-        self._populate_library(library_entries)
+        self._replace_library(library_entries)
         return GLib.SOURCE_REMOVE
 
-    def _populate_library(self, library_entries):
-        """Bulk-insert all library entries using splice for minimal UI churn."""
+    def _replace_library(self, library_entries):
+        """Clear and repopulate list models in short GTK-thread batches."""
         _preload_folder_cache()
-        buckets = {cat: [] for cat in self.category_views}
-        for category, item_data in library_entries:
+        self._library_insert_generation += 1
+        generation = self._library_insert_generation
+        self._library_insert_entries = library_entries
+        self._library_insert_index = 0
+        self._library_clear_existing = True
+        self._insert_library_batch(generation)
+
+    def _insert_library_batch(self, generation):
+        if generation != self._library_insert_generation:
+            return GLib.SOURCE_REMOVE
+        if self._library_clear_existing:
+            has_more_to_clear = False
+            for store in self.category_views.values():
+                remove_count = min(
+                    LIBRARY_INSERT_BATCH_SIZE, store.get_n_items()
+                )
+                if remove_count:
+                    store.splice(0, remove_count, [])
+                has_more_to_clear |= store.get_n_items() > 0
+            if has_more_to_clear:
+                GLib.timeout_add(1, self._insert_library_batch, generation)
+                return GLib.SOURCE_REMOVE
+            self._library_clear_existing = False
+            GLib.timeout_add(1, self._insert_library_batch, generation)
+            return GLib.SOURCE_REMOVE
+
+        entries = self._library_insert_entries
+        start = self._library_insert_index
+        end = min(start + LIBRARY_INSERT_BATCH_SIZE, len(entries))
+        buckets = {category: [] for category in self.category_views}
+        for category, item_data in entries[start:end]:
             if category in buckets:
                 buckets[category].append(
                     AnimeItem(
@@ -1035,9 +1130,21 @@ class UI:
                     )
                 )
         for category, items in buckets.items():
-            store = self.category_views[category]
             if items:
-                store.splice(0, store.get_n_items(), items)
+                self.category_views[category].splice(
+                    self.category_views[category].get_n_items(), 0, items
+                )
+        self._library_insert_index = end
+        if end < len(entries):
+            GLib.timeout_add(1, self._insert_library_batch, generation)
+            return GLib.SOURCE_REMOVE
+
+        self._library_insert_entries = None
+        if getattr(self, "library_population_refresh", False):
+            self.library_population_refresh = False
+            self.refresh_busy = False
+            self.refresh_spinner.stop()
+            self.refresh_spinner.set_visible(False)
         self.library_progress_bar.set_visible(False)
         self.auth_spinner.set_visible(True)
         self.auth_spinner.stop()
@@ -1052,10 +1159,14 @@ class UI:
     def load_profile_images(self, token, viewer):
         api = self.anilist_api
         image_data = []
-        for url in (viewer.get("avatar", {}).get("large"), viewer.get("bannerImage")):
+        for image_name, url in (
+            ("avatar", viewer.get("avatar", {}).get("large")),
+            ("banner", viewer.get("bannerImage")),
+        ):
             try:
                 image_data.append(api.download(url) if url else None)
-            except Exception:
+            except Exception as error:
+                print(f"Could not download AniList {image_name}: {error}", flush=True)
                 image_data.append(None)
         GLib.idle_add(self.finish_profile_images, token, *image_data)
 
@@ -1071,13 +1182,22 @@ class UI:
                     Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
                 )
                 self.avatar_stack.set_visible_child_name("profile")
-            except Exception:
+            except Exception as error:
+                print(f"Could not display AniList avatar: {error}", flush=True)
+                self.avatar_picture.set_paintable(None)
                 self.avatar_stack.set_visible_child_name("default")
-        self.banner_picture.set_paintable(
-            banner_texture_from_image_data(banner_data, 1600, 96)
-            if banner_data
-            else None
-        )
+        else:
+            self.avatar_picture.set_paintable(None)
+            self.avatar_stack.set_visible_child_name("default")
+        try:
+            self.banner_picture.set_paintable(
+                banner_texture_from_image_data(banner_data, 1600, 96)
+                if banner_data
+                else None
+            )
+        except Exception as error:
+            print(f"Could not display AniList banner: {error}", flush=True)
+            self.banner_picture.set_paintable(None)
         return GLib.SOURCE_REMOVE
 
     def refresh_library(self):
@@ -1108,47 +1228,39 @@ class UI:
 
     def finish_refresh(self, token, result):
         library_entries, error = result
-        self.refresh_spinner.stop()
-        self.refresh_spinner.set_visible(False)
-        self.refresh_busy = False
         if token != self.access_token:
+            self.refresh_spinner.stop()
+            self.refresh_spinner.set_visible(False)
+            self.refresh_busy = False
             self.update_auth_controls()
             return GLib.SOURCE_REMOVE
         if error:
+            self.refresh_spinner.stop()
+            self.refresh_spinner.set_visible(False)
+            self.refresh_busy = False
             self.update_auth_controls()
             self.show_error("Refresh Failed", f"Could not refresh your library: {error}")
             return GLib.SOURCE_REMOVE
+        self._details_request_id += 1
         self._anime_info_cache.clear()
         self._cover_texture_cache.clear()
         self._cover_bytes_cache.clear()
         _preload_folder_cache()
-        buckets = {cat: [] for cat in self.category_views}
-        for category, item_data in library_entries:
-            if category in buckets:
-                buckets[category].append(
-                    AnimeItem(
-                        **item_data,
-                        folder_path=_get_cached_anime_folder(item_data["anime_id"]),
-                    )
-                )
-        for category, items in buckets.items():
-            store = self.category_views[category]
-            store.splice(0, store.get_n_items(), items)
-        self.update_library_summary()
-        self.update_auth_controls()
+        self.refresh_busy = True
+        self.refresh_spinner.set_visible(True)
+        self.refresh_spinner.start()
+        self.refresh_button.set_sensitive(False)
+        self.library_population_refresh = True
+        self._replace_library(library_entries)
         return GLib.SOURCE_REMOVE
 
     def load_authenticated_user(self):
         self.authenticate(self.access_token, startup=True)
 
-    def on_local_video_complete(self, media_title, media_url):
+    def find_watching_anime_match(self, media_title, media_url):
         episode_number = extract_episode_number(media_title) or extract_episode_number(
             media_url
         )
-        if not episode_number:
-            print(f"Episode update skipped: no episode number in {media_title}")
-            return False
-
         candidates = [media_title, media_url]
         normalized_candidates = {
             normalize_title(clean_video_title(candidate))
@@ -1161,10 +1273,6 @@ class UI:
             self.category_views.get("REWATCHING"),
         ]
         
-        if all(store is None or store.get_n_items() == 0 for store in stores_to_check):
-            print("Episode update deferred: Currently Watching and Rewatching lists are empty")
-            return False
-
         for store in stores_to_check:
             if store is None:
                 continue
@@ -1185,7 +1293,8 @@ class UI:
                             matched_alias_lengths.append(len(normalized_alias))
                             break
                         if (
-                            alias_tokens[-1].isdigit()
+                            episode_number
+                            and alias_tokens[-1].isdigit()
                             and int(alias_tokens[-1]) == episode_number
                             and candidate_tokens == alias_tokens[:-1]
                         ):
@@ -1197,25 +1306,119 @@ class UI:
                     matches.append((max(matched_alias_lengths), anime))
 
         if not matches:
-            considered = []
-            for store in stores_to_check:
-                if store:
-                    considered.extend([store.get_item(i).title for i in range(store.get_n_items())])
-            print(
-                f"Episode update skipped: no Currently Watching or Rewatching title matched "
-                f"'{media_title}' (episode {episode_number}); titles: {considered}"
-            )
-            return False
+            return "unmatched", None, episode_number
         best_length = max(length for length, _anime in matches)
         best_matches = [anime for length, anime in matches if length == best_length]
         if len(best_matches) != 1:
-            print(
-                f"Episode update skipped: title '{media_title}' matched multiple "
-                "Currently Watching or Rewatching entries"
-            )
-            return False
+            return "ambiguous", None, episode_number
+        return "matched", best_matches[0], episode_number
 
-        anime = best_matches[0]
+    def on_local_video_started(self, media_title, media_url):
+        match_status, _anime, _episode_number = self.find_watching_anime_match(
+            media_title, media_url
+        )
+        if match_status == "unmatched":
+            self.show_unmatched_video_dialog(media_title, media_url)
+
+    def on_local_video_complete(self, media_title, media_url):
+        match_status, anime, episode_number = self.find_watching_anime_match(
+            media_title, media_url
+        )
+        if match_status != "matched":
+            return True
+        return self.queue_episode_progress_update(anime, episode_number, media_url)
+
+    def show_unmatched_video_dialog(self, media_title, media_url):
+        anime_options = []
+        seen_ids = set()
+        for category in ("CURRENTLY WATCHING", "REWATCHING"):
+            store = self.category_views.get(category)
+            if not store:
+                continue
+            for index in range(store.get_n_items()):
+                anime = store.get_item(index)
+                if anime.anime_id not in seen_ids:
+                    seen_ids.add(anime.anime_id)
+                    anime_options.append(anime)
+
+        if not anime_options:
+            self.show_error(
+                "No anime to link",
+                "Sign in and refresh your AniList library before linking this video.",
+            )
+            return True
+
+        status_labels = dict(STATUS_OPTIONS)
+        options = [
+            f"{anime.title} ({status_labels.get(anime.status, anime.status)})"
+            for anime in anime_options
+        ]
+        dialog = Gtk.Dialog(
+            title="Link video to anime", transient_for=self.root, modal=True
+        )
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Link", Gtk.ResponseType.ACCEPT)
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+        content.append(
+            Gtk.Label(
+                label=(
+                    f"No Watching or Rewatching anime matched this video:\n"
+                    f"{Path(unquote(urlparse(media_url).path)).name or media_title}\n\n"
+                    "Choose the anime this title belongs to. The title will be "
+                    "remembered, and episode progress will update at completion."
+                ),
+                wrap=True,
+                xalign=0,
+            )
+        )
+        dropdown = Gtk.DropDown(model=Gtk.StringList.new(options), hexpand=True)
+        content.append(dropdown)
+        dialog.connect(
+            "response",
+            self.on_unmatched_video_response,
+            dropdown,
+            anime_options,
+            media_title,
+            media_url,
+        )
+        dialog.present()
+        return True
+
+    def on_unmatched_video_response(
+        self, dialog, response, dropdown, anime_options, media_title, media_url
+    ):
+        if response == Gtk.ResponseType.ACCEPT:
+            selected = dropdown.get_selected()
+            if selected < len(anime_options):
+                anime = anime_options[selected]
+                try:
+                    alias = save_anime_video_title(anime.anime_id, media_title)
+                except OSError as error:
+                    self.show_error("Title Link Failed", str(error))
+                else:
+                    if alias:
+                        anime.title_aliases = "\n".join(
+                            dict.fromkeys(
+                                [
+                                    *filter(None, anime.title_aliases.split("\n")),
+                                    alias,
+                                ]
+                            )
+                        )
+                        watcher = getattr(self, "video_watcher", None)
+                        if watcher:
+                            watcher.retry_video(media_url)
+        dialog.destroy()
+
+    def queue_episode_progress_update(self, anime, episode_number, media_url):
+        if not episode_number:
+            print(f"Episode update skipped: no episode number for {anime.title}")
+            return True
         new_progress = max(anime.watched_episodes, episode_number)
         if anime.episodes_total > 0:
             new_progress = min(new_progress, anime.episodes_total)
@@ -1293,6 +1496,13 @@ class UI:
         self.pending_episode_updates.pop(request_id, None)
 
     def logout(self):
+        self._library_insert_generation += 1
+        self._library_insert_entries = None
+        self.library_population_refresh = False
+        self.refresh_busy = False
+        self.refresh_spinner.stop()
+        self.refresh_spinner.set_visible(False)
+        self._details_request_id += 1
         self.access_token = None
         self.current_user = ""
         self.anilist_api.access_token = None
@@ -1347,6 +1557,50 @@ class UI:
         anime.score = new_score
         self.queue_list_update(anime, "score", new_score, previous, dropdown)
 
+    def on_status_changed(self, dropdown):
+        if getattr(dropdown, "is_binding", False):
+            return
+        anime = getattr(dropdown, "anime", None)
+        if not anime:
+            return
+        selected = dropdown.get_selected()
+        if selected >= len(STATUS_OPTIONS):
+            return
+        previous = anime.status
+        new_status = STATUS_OPTIONS[selected][0]
+        if new_status == previous:
+            return
+        anime.status = new_status
+        self.move_anime_to_status(anime, new_status)
+        self.queue_list_update(anime, "status", new_status, previous, dropdown)
+
+    def move_anime_to_status(self, anime, status):
+        target_category = STATUS_TO_CATEGORY.get(status)
+        if not target_category:
+            return
+        target_store = self.category_views.get(target_category)
+        if not target_store:
+            return
+        source_store = next(
+            (
+                store
+                for store in self.category_views.values()
+                if any(
+                    store.get_item(index) is anime
+                    for index in range(store.get_n_items())
+                )
+            ),
+            None,
+        )
+        if source_store is target_store:
+            return
+        if source_store:
+            for index in range(source_store.get_n_items()):
+                if source_store.get_item(index) is anime:
+                    source_store.remove(index)
+                    break
+        target_store.append(anime)
+
     def play_anime(self, anime):
         if not anime:
             return
@@ -1394,6 +1648,10 @@ class UI:
                     self.play_next_episode(anime, Path(folder))
         chooser.destroy()
 
+    def clear_anime_folder(self, anime):
+        save_anime_folder(anime.anime_id, "")
+        anime.folder_path = ""
+
     def show_anime_context_menu(self, widget, anime, x, y):
         if not anime:
             return
@@ -1415,9 +1673,17 @@ class UI:
                 "Select anime folder…",
                 lambda: self.choose_anime_folder(anime),
             ),
+            (
+                "Clear anime folder",
+                lambda: self.clear_anime_folder(anime),
+            ),
             ("Play next episode", lambda: self.play_anime(anime)),
         ):
             button = Gtk.Button(label=label, has_frame=False, hexpand=True)
+            if label == "Clear anime folder":
+                button.set_sensitive(
+                    bool(anime.folder_path or read_anime_folder(anime.anime_id))
+                )
             button.connect("clicked", lambda _button, run=callback: run())
             actions.append(button)
         popover.set_child(actions)
@@ -1525,6 +1791,8 @@ class UI:
                 api = self.anilist_api
                 if field == "progress":
                     api.update_progress(media_id, value)
+                elif field == "status":
+                    api.update_status(media_id, value)
                 else:
                     api.update_score(media_id, value)
                 error = None
@@ -1605,6 +1873,22 @@ class UI:
             if getattr(widget, "anime", None) is anime:
                 widget.pbar.set_fraction(anime.progress_fraction)
                 widget.pbar.set_text(anime.progress)
+        elif field == "status":
+            anime.status = value
+            self.move_anime_to_status(anime, value)
+            if getattr(widget, "anime", None) is anime:
+                widget.is_binding = True
+                widget.set_selected(
+                    next(
+                        (
+                            index
+                            for index, (status, _) in enumerate(STATUS_OPTIONS)
+                            if status == value
+                        ),
+                        0,
+                    )
+                )
+                widget.is_binding = False
         else:
             anime.score = value
             if getattr(widget, "anime", None) is anime:
@@ -1713,9 +1997,27 @@ class UI:
         self._details_request_id += 1
         request_id = self._details_request_id
 
-        cached_info = self._anime_info_cache.get(anime_id)
+        cached_info = self._cache_get(self._anime_info_cache, anime_id)
         if cached_info:
             self._apply_anime_details(cached_info, anime_id)
+            cover_url = cached_info.get("coverImage", {}).get("large", "")
+            if cover_url:
+                cached_texture = self._cache_get(
+                    self._cover_texture_cache, cover_url
+                )
+                cached_bytes = self._cache_get(self._cover_bytes_cache, cover_url)
+                if not cached_texture and not cached_bytes:
+                    Thread(
+                        target=self._fetch_cached_cover,
+                        args=(
+                            request_id,
+                            anime_id,
+                            cached_info,
+                            cover_url,
+                            self.anilist_api,
+                        ),
+                        daemon=True,
+                    ).start()
             return
 
         self.metadata_label.set_markup(
@@ -1727,19 +2029,21 @@ class UI:
         api = self.anilist_api
 
         def fetch():
+            if request_id != self._details_request_id:
+                return
             try:
                 info = api.fetch_anime_info(anime_id)
+                if request_id != self._details_request_id:
+                    return
                 cover_url = info.get("coverImage", {}).get("large", "")
                 cover_bytes = None
                 if cover_url:
-                    cached_bytes = self._cover_bytes_cache.get(cover_url)
-                    if cached_bytes:
-                        cover_bytes = cached_bytes
-                    else:
-                        try:
-                            cover_bytes = api.download(cover_url)
-                        except Exception:
-                            cover_bytes = None
+                    try:
+                        cover_bytes = api.download(cover_url)
+                    except Exception:
+                        cover_bytes = None
+                if request_id != self._details_request_id:
+                    return
                 GLib.idle_add(
                     self._finish_anime_details,
                     request_id, anime_id, info, cover_url, cover_bytes, None,
@@ -1752,6 +2056,39 @@ class UI:
 
         Thread(target=fetch, daemon=True).start()
 
+    def _fetch_cached_cover(self, request_id, anime_id, info, cover_url, api):
+        if request_id != self._details_request_id:
+            return
+        try:
+            cover_bytes = api.download(cover_url)
+        except Exception as error:
+            print(f"Could not reload anime cover: {error}", flush=True)
+            return
+        if request_id == self._details_request_id:
+            GLib.idle_add(
+                self._finish_anime_details,
+                request_id,
+                anime_id,
+                info,
+                cover_url,
+                cover_bytes,
+                None,
+            )
+
+    @staticmethod
+    def _cache_get(cache, key):
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    @staticmethod
+    def _cache_set(cache, key, value, limit):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
     def _finish_anime_details(
         self, request_id, anime_id, info, cover_url, cover_bytes, error
     ):
@@ -1763,27 +2100,43 @@ class UI:
             )
             self.set_details_text(str(error) if error else "")
             return GLib.SOURCE_REMOVE
-        self._anime_info_cache[anime_id] = info
+        self._cache_set(
+            self._anime_info_cache, anime_id, info, ANIME_INFO_CACHE_LIMIT
+        )
         if cover_url and cover_bytes:
-            self._cover_bytes_cache[cover_url] = cover_bytes
+            self._cache_set(
+                self._cover_bytes_cache,
+                cover_url,
+                cover_bytes,
+                COVER_BYTES_CACHE_LIMIT,
+            )
         self._apply_anime_details(info, anime_id)
         return GLib.SOURCE_REMOVE
 
     def _apply_anime_details(self, info, anime_id):
         cover_url = info.get("coverImage", {}).get("large", "")
         if cover_url:
-            cached_texture = self._cover_texture_cache.get(cover_url)
+            cached_texture = self._cache_get(
+                self._cover_texture_cache, cover_url
+            )
             if cached_texture:
                 self.right_cover_picture.set_paintable(cached_texture)
             else:
-                cover_bytes = self._cover_bytes_cache.get(cover_url)
+                cover_bytes = self._cache_get(
+                    self._cover_bytes_cache, cover_url
+                )
                 if cover_bytes:
                     try:
                         loader = GdkPixbuf.PixbufLoader.new()
                         loader.write(cover_bytes)
                         loader.close()
                         texture = Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
-                        self._cover_texture_cache[cover_url] = texture
+                        self._cache_set(
+                            self._cover_texture_cache,
+                            cover_url,
+                            texture,
+                            COVER_TEXTURE_CACHE_LIMIT,
+                        )
                         self.right_cover_picture.set_paintable(texture)
                     except Exception:
                         self.right_cover_picture.set_paintable(None)
@@ -1947,6 +2300,7 @@ def read_client_id():
 
 
 def prepare_media_entries(media_lists):
+    _preload_folder_cache()
     mapping = {
         "Dropped": "DROPPED",
         "Completed": "COMPLETED",
@@ -1979,6 +2333,7 @@ def prepare_media_entries(media_lists):
                         title_data.get("romaji"),
                         title_data.get("native"),
                         *media.get("synonyms", []),
+                        *_get_cached_anime_video_titles(str(media.get("id"))),
                     )
                     if value
                 )
@@ -2001,6 +2356,7 @@ def prepare_media_entries(media_lists):
                         ),
                         "progress_fraction": fraction,
                         "score": int(entry.get("score", 0) or 0),
+                        "status": entry.get("status") or CATEGORY_TO_STATUS[category],
                         "format_type": str(media.get("format", "N/A")),
                         "anime_id": str(media.get("id")),
                         "episodes_total": episodes,
@@ -2123,6 +2479,17 @@ def _get_cached_anime_folder(anime_id):
     return _folder_cache.get(f"anime_folder_{anime_id}", "")
 
 
+def _get_cached_anime_video_titles(anime_id):
+    raw_titles = _folder_cache.get(f"anime_video_titles_{anime_id}", "[]")
+    try:
+        titles = json.loads(raw_titles)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(titles, list):
+        return []
+    return [title for title in titles if isinstance(title, str) and title]
+
+
 def _read_anime_folder_cached(anime_id):
     _preload_folder_cache()
     return _get_cached_anime_folder(anime_id)
@@ -2152,7 +2519,24 @@ def read_anime_folder(anime_id):
 
 
 def save_anime_folder(anime_id, folder):
-    save_preference(anime_folder_preference_key(anime_id), folder)
+    key = anime_folder_preference_key(anime_id)
+    save_preference(key, folder)
+    _folder_cache[key] = str(folder)
+
+
+def save_anime_video_title(anime_id, video_title):
+    alias = clean_video_title(video_title)
+    if not normalize_title(alias):
+        return ""
+    key = f"anime_video_titles_{anime_id}"
+    titles = _get_cached_anime_video_titles(anime_id)
+    normalized_titles = {normalize_title(title) for title in titles}
+    if normalize_title(alias) not in normalized_titles:
+        titles.append(alias)
+        serialized = json.dumps(titles, ensure_ascii=True)
+        save_preference(key, serialized)
+        _folder_cache[key] = serialized
+    return alias
 
 
 def read_preference(key, fallback, getter):
