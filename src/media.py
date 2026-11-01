@@ -60,11 +60,16 @@ def prepare_media_entries(media_lists):
                 )
             )
             episodes = media.get("episodes") or 0
+            next_airing = media.get("nextAiringEpisode") or {}
+            episodes_aired = max(0, int(next_airing.get("episode", 1) or 1) - 1)
             progress = entry.get("progress", 0) or 0
+            denominator = episodes or (
+                max(episodes_aired, progress) if episodes_aired > 0 else 0
+            )
             fraction = (
-                min(max(progress / episodes, 0.0), 1.0)
-                if episodes > 0
-                else 1.0
+                min(max(progress / denominator, 0.0), 1.0)
+                if denominator > 0
+                else 0.0
             )
             prepared.append(
                 (
@@ -82,7 +87,9 @@ def prepare_media_entries(media_lists):
                         "status": entry.get("status") or CATEGORY_TO_STATUS[category],
                         "format_type": str(media.get("format", "N/A")),
                         "anime_id": str(media.get("id")),
+                        "list_entry_id": int(entry.get("id") or 0),
                         "episodes_total": episodes,
+                        "episodes_aired": episodes_aired,
                         "watched_episodes": progress,
                     },
                 )

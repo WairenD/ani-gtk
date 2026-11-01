@@ -105,6 +105,7 @@ class AniListAPI:
                 lists {
                     name
                     entries {
+                        id
                         media {
                             id
                             title {
@@ -115,6 +116,9 @@ class AniListAPI:
                             synonyms
                             format
                             episodes
+                            nextAiringEpisode {
+                                episode
+                            }
                         }
                         status
                         progress
@@ -128,6 +132,32 @@ class AniListAPI:
             "userId": user_id
         }
         return self._post(query, variables)["MediaListCollection"]["lists"]
+
+    def search_anime(self, search):
+        query = """
+        query ($search: String) {
+            Page(perPage: 20) {
+                media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+                    id
+                    title {
+                        english
+                        romaji
+                        native
+                    }
+                    coverImage {
+                        medium
+                    }
+                    synonyms
+                    format
+                    episodes
+                    nextAiringEpisode {
+                        episode
+                    }
+                }
+            }
+        }
+        """
+        return self._post(query, {"search": search})["Page"]["media"]
 
     def update_progress(self, media_id, progress):
         query = """
@@ -164,6 +194,17 @@ class AniListAPI:
         """
         variables = {"mediaId": int(media_id), "status": status}
         return self._post(query, variables)["SaveMediaListEntry"]
+
+    def delete_media_list_entry(self, entry_id):
+        query = """
+        mutation ($entryId: Int!) {
+            DeleteMediaListEntry(id: $entryId) {
+                deleted
+            }
+        }
+        """
+        variables = {"entryId": int(entry_id)}
+        return self._post(query, variables)["DeleteMediaListEntry"]
 
     def fetch_anime_info(self, anime_id):
         query = '''

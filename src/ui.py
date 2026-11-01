@@ -55,8 +55,10 @@ class AnimeItem(GObject.GObject):
     status = GObject.Property(type=str, default="PLANNING")
     format_type = GObject.Property(type=str, default="")
     anime_id = GObject.Property(type=str, default="")
+    list_entry_id = GObject.Property(type=int, default=0)
     folder_path = GObject.Property(type=str, default="")
     episodes_total = GObject.Property(type=int, default=0)
+    episodes_aired = GObject.Property(type=int, default=0)
     watched_episodes = GObject.Property(type=int, default=0)
 
     def __init__(self, **kw):
@@ -738,6 +740,14 @@ class UI:
         menu_button.set_tooltip_text("Application menu")
         titlebar.pack_start(menu_button)
 
+        self.add_anime_button = Gtk.Button()
+        self.add_anime_button.set_icon_name("list-add-symbolic")
+        self.add_anime_button.set_tooltip_text("Add anime to your list")
+        self.add_anime_button.connect(
+            "clicked", lambda *_: self.show_add_anime_dialog()
+        )
+        titlebar.pack_start(self.add_anime_button)
+
         self.refresh_button = Gtk.Button()
         self.refresh_button.set_icon_name("view-refresh-symbolic")
         self.refresh_button.set_tooltip_text("Refresh library (Ctrl+R)")
@@ -935,6 +945,8 @@ class UI:
         refreshing = getattr(self, "refresh_busy", False)
         self.login_button.set_visible(not signed_in)
         self.login_button.set_sensitive(not busy)
+        self.add_anime_button.set_visible(signed_in)
+        self.add_anime_button.set_sensitive(signed_in and not busy and not refreshing)
         self.logout_button.set_visible(signed_in)
         self.logout_button.set_sensitive(not busy and not refreshing)
         if hasattr(self, "login_action"):
@@ -946,6 +958,327 @@ class UI:
             self.refresh_button.set_sensitive(signed_in and not busy and not refreshing)
         if not signed_in:
             self.avatar_stack.set_visible_child_name("default")
+
+    def show_add_anime_dialog(self):
+        if not self.access_token:
+            self.show_error("Not signed in", "Log in to add anime to your list.")
+            return
+
+        dialog = Gtk.Dialog(
+            title="Add Anime to List", transient_for=self.root, modal=True
+        )
+        dialog.set_default_size(760, 640)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Add to List", Gtk.ResponseType.ACCEPT)
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        search_entry = Gtk.Entry(placeholder_text="Search anime titles")
+        search_entry.set_hexpand(True)
+        search_button = Gtk.Button(label="Search")
+        search_row.append(search_entry)
+        search_row.append(search_button)
+        content.append(search_row)
+
+        results_list = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.SINGLE,
+            vexpand=True,
+            hexpand=True,
+        )
+        results_list.add_css_class("anime-search-results")
+        results_scroll = Gtk.ScrolledWindow(
+            vexpand=True,
+            hexpand=True,
+            min_content_height=360,
+        )
+        results_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        results_scroll.set_child(results_list)
+        content.append(results_scroll)
+
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        status_row.append(Gtk.Label(label="Add to", xalign=0))
+        status_dropdown = Gtk.DropDown(
+            model=self.status_options_model, hexpand=True
+        )
+        status_dropdown.set_selected(
+            next(
+                index
+                for index, (status, _) in enumerate(STATUS_OPTIONS)
+                if status == "PLANNING"
+            )
+        )
+        status_row.append(status_dropdown)
+        content.append(status_row)
+
+        status_label = Gtk.Label(label="", xalign=0, wrap=True)
+        content.append(status_label)
+
+        self._add_anime_dialog_state = {
+            "dialog": dialog,
+            "request_id": 0,
+            "results": [],
+            "search_entry": search_entry,
+            "results_list": results_list,
+            "status_dropdown": status_dropdown,
+            "status_label": status_label,
+            "search_button": search_button,
+        }
+        search_button.connect(
+            "clicked", lambda *_: self.search_anime_for_dialog(dialog)
+        )
+        search_entry.connect(
+            "activate", lambda *_: self.search_anime_for_dialog(dialog)
+        )
+        dialog.connect("response", self.on_add_anime_dialog_response)
+        dialog.present()
+
+    def search_anime_for_dialog(self, dialog):
+        state = getattr(self, "_add_anime_dialog_state", None)
+        if not state or state["dialog"] is not dialog:
+            return
+        search = state["search_entry"].get_text().strip()
+        if len(search) < 2:
+            state["status_label"].set_text("Enter at least two characters to search.")
+            return
+
+        state["request_id"] += 1
+        request_id = state["request_id"]
+        state["status_label"].set_text("Searching AniList…")
+        state["search_button"].set_sensitive(False)
+        api = self.anilist_api
+
+        def search_anime():
+            try:
+                result = (api.search_anime(search), None)
+            except Exception as error:
+                result = (None, error)
+            GLib.idle_add(
+                self.finish_anime_search,
+                dialog,
+                request_id,
+                result,
+            )
+
+        Thread(target=search_anime, daemon=True).start()
+
+    def finish_anime_search(self, dialog, request_id, result):
+        state = getattr(self, "_add_anime_dialog_state", None)
+        if (
+            not state
+            or state["dialog"] is not dialog
+            or state["request_id"] != request_id
+        ):
+            return GLib.SOURCE_REMOVE
+        results, error = result
+        state["search_button"].set_sensitive(True)
+        if error:
+            state["status_label"].set_text(f"Search failed: {error}")
+            return GLib.SOURCE_REMOVE
+        state["results"] = results or []
+        results_list = state["results_list"]
+        while child := results_list.get_first_child():
+            results_list.remove(child)
+        for media in state["results"]:
+            title_data = media.get("title", {})
+            title = (
+                title_data.get("english")
+                or title_data.get("romaji")
+                or title_data.get("native")
+                or "Unknown"
+            )
+            label = Gtk.Label(
+                label=f"{title} - {media.get('format') or 'Anime'}",
+                xalign=0,
+                margin_start=12,
+                margin_end=12,
+                margin_top=10,
+                margin_bottom=10,
+                hexpand=True,
+            )
+            row_content = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                spacing=12,
+                margin_start=8,
+                margin_end=8,
+                margin_top=6,
+                margin_bottom=6,
+            )
+            picture = Gtk.Picture()
+            picture.set_size_request(48, 64)
+            picture.set_can_shrink(True)
+            picture.set_content_fit(Gtk.ContentFit.COVER)
+            picture.add_css_class("cover-image")
+            row_content.append(picture)
+            row_content.append(label)
+            row = Gtk.ListBoxRow(child=row_content)
+            row.cover_picture = picture
+            results_list.append(row)
+        if state["results"]:
+            results_list.select_row(results_list.get_row_at_index(0))
+        state["status_label"].set_text(
+            f"{len(state['results'])} results"
+            if state["results"]
+            else "No matching anime found."
+        )
+        Thread(
+            target=self.load_anime_search_covers,
+            args=(dialog, request_id, list(state["results"]), self.anilist_api),
+            daemon=True,
+        ).start()
+        return GLib.SOURCE_REMOVE
+
+    def load_anime_search_covers(self, dialog, request_id, results, api):
+        for index, media in enumerate(results):
+            cover_url = media.get("coverImage", {}).get("medium")
+            if not cover_url:
+                continue
+            try:
+                image_bytes = api.download(cover_url)
+            except Exception:
+                continue
+            GLib.idle_add(
+                self.set_anime_search_cover,
+                dialog,
+                request_id,
+                index,
+                image_bytes,
+            )
+
+    def set_anime_search_cover(self, dialog, request_id, index, image_bytes):
+        state = getattr(self, "_add_anime_dialog_state", None)
+        if (
+            not state
+            or state["dialog"] is not dialog
+            or state["request_id"] != request_id
+            or index >= len(state["results"])
+        ):
+            return GLib.SOURCE_REMOVE
+        row = state["results_list"].get_row_at_index(index)
+        if not row:
+            return GLib.SOURCE_REMOVE
+        try:
+            loader = GdkPixbuf.PixbufLoader.new()
+            loader.write(image_bytes)
+            loader.close()
+            texture = Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
+            row.cover_picture.set_paintable(texture)
+        except Exception as error:
+            print(f"Could not display anime search cover: {error}", flush=True)
+        return GLib.SOURCE_REMOVE
+
+    def on_add_anime_dialog_response(self, dialog, response):
+        state = getattr(self, "_add_anime_dialog_state", None)
+        if not state or state["dialog"] is not dialog:
+            dialog.close()
+            return
+        if response != Gtk.ResponseType.ACCEPT:
+            state["request_id"] += 1
+            self._add_anime_dialog_state = None
+            dialog.close()
+            return
+
+        selected_row = state["results_list"].get_selected_row()
+        selected = selected_row.get_index() if selected_row else -1
+        if selected < 0 or selected >= len(state["results"]):
+            state["status_label"].set_text("Search and select an anime first.")
+            return
+        status_index = state["status_dropdown"].get_selected()
+        if status_index >= len(STATUS_OPTIONS):
+            state["status_label"].set_text("Select a list status.")
+            return
+
+        media = state["results"][selected]
+        status = STATUS_OPTIONS[status_index][0]
+        state["request_id"] += 1
+        request_id = state["request_id"]
+        state["status_label"].set_text("Adding anime…")
+        state["search_button"].set_sensitive(False)
+        api = self.anilist_api
+
+        def add_anime():
+            try:
+                result = (api.update_status(media["id"], status), None)
+            except Exception as error:
+                result = (None, error)
+            GLib.idle_add(
+                self.finish_add_anime,
+                dialog,
+                request_id,
+                media,
+                status,
+                result,
+            )
+
+        Thread(target=add_anime, daemon=True).start()
+
+    def finish_add_anime(self, dialog, request_id, media, status, result):
+        state = getattr(self, "_add_anime_dialog_state", None)
+        if (
+            not state
+            or state["dialog"] is not dialog
+            or state["request_id"] != request_id
+        ):
+            return GLib.SOURCE_REMOVE
+        saved_entry, error = result
+        if error:
+            state["search_button"].set_sensitive(True)
+            state["status_label"].set_text(f"Could not add anime: {error}")
+            return GLib.SOURCE_REMOVE
+
+        anime_id = str(media["id"])
+        existing = next(
+            (
+                store.get_item(index)
+                for store in self.category_views.values()
+                for index in range(store.get_n_items())
+                if store.get_item(index).anime_id == anime_id
+            ),
+            None,
+        )
+        if existing:
+            existing.list_entry_id = int(saved_entry.get("id") or existing.list_entry_id)
+            existing.status = status
+            self.move_anime_to_status(existing, status)
+        else:
+            status_to_list_name = {
+                "CURRENT": "Watching",
+                "REPEATING": "Rewatching",
+                "COMPLETED": "Completed",
+                "DROPPED": "Dropped",
+                "PLANNING": "Planning",
+                "PAUSED": "Paused",
+            }
+            entries = prepare_media_entries(
+                [
+                    {
+                        "name": status_to_list_name[status],
+                        "entries": [
+                            {
+                                "media": media,
+                                "progress": 0,
+                                "score": 0,
+                                "status": status,
+                            }
+                        ],
+                    }
+                ]
+            )
+            if entries:
+                category, item_data = entries[0]
+                item_data["list_entry_id"] = int(saved_entry.get("id") or 0)
+                item_data["folder_path"] = _get_cached_anime_folder(anime_id)
+                self.category_views[category].append(AnimeItem(**item_data))
+        self.update_library_summary()
+        self._add_anime_dialog_state = None
+        dialog.close()
+        return GLib.SOURCE_REMOVE
 
     def start_login(self):
         client_id = read_client_id()
@@ -1569,8 +1902,12 @@ class UI:
             watched = min(watched, anime.episodes_total)
             anime.progress_fraction = watched / anime.episodes_total
             anime.progress = f"{watched}/{anime.episodes_total}"
+        elif anime.episodes_aired > 0:
+            denominator = max(anime.episodes_aired, watched)
+            anime.progress_fraction = min(watched / denominator, 1.0)
+            anime.progress = f"{watched}/?"
         else:
-            anime.progress_fraction = 1.0
+            anime.progress_fraction = 0.0
             anime.progress = f"{watched}/?"
         anime.watched_episodes = watched
         return watched
@@ -1708,6 +2045,10 @@ class UI:
                 "Clear anime folder",
                 lambda: self.clear_anime_folder(anime),
             ),
+            (
+                "Remove from AniList",
+                lambda: self.confirm_remove_anime(anime),
+            ),
             ("Play next episode", lambda: self.play_anime(anime)),
         ):
             button = Gtk.Button(label=label, has_frame=False, hexpand=True)
@@ -1727,6 +2068,70 @@ class UI:
         popover.set_pointing_to(pointing)
         popover.connect("closed", lambda current: current.unparent())
         popover.popup()
+
+    def confirm_remove_anime(self, anime):
+        if not anime.list_entry_id:
+            self.show_error(
+                "Cannot remove anime",
+                "This entry has no AniList list ID. Refresh your library and try again.",
+            )
+            return
+        dialog = Gtk.Dialog(
+            title="Remove anime from AniList",
+            transient_for=self.root,
+            modal=True,
+        )
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Remove", Gtk.ResponseType.ACCEPT)
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+        content.append(
+            Gtk.Label(
+                label=f"Remove {anime.title} from your AniList library?",
+                wrap=True,
+                xalign=0,
+            )
+        )
+        dialog.connect(
+            "response", self.on_remove_anime_response, anime
+        )
+        dialog.present()
+
+    def on_remove_anime_response(self, dialog, response, anime):
+        if response != Gtk.ResponseType.ACCEPT:
+            dialog.close()
+            return
+        dialog.set_sensitive(False)
+
+        def delete_entry():
+            try:
+                result = (self.anilist_api.delete_media_list_entry(anime.list_entry_id), None)
+            except Exception as error:
+                result = (None, error)
+            GLib.idle_add(self.finish_remove_anime, dialog, anime, result)
+
+        Thread(target=delete_entry, daemon=True).start()
+
+    def finish_remove_anime(self, dialog, anime, result):
+        deletion, error = result
+        dialog.close()
+        if error:
+            self.show_error("Remove Failed", f"AniList did not remove the anime: {error}")
+            return GLib.SOURCE_REMOVE
+        if not deletion or not deletion.get("deleted"):
+            self.show_error("Remove Failed", "AniList did not delete this list entry.")
+            return GLib.SOURCE_REMOVE
+        for store in self.category_views.values():
+            for index in range(store.get_n_items()):
+                if store.get_item(index) is anime:
+                    store.remove(index)
+                    self.update_library_summary()
+                    return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_REMOVE
 
     def play_next_episode(self, anime, folder):
         next_episode = anime.watched_episodes + 1
